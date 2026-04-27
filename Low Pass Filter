@@ -1,0 +1,52 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Mar 28 22:02:41 2026
+
+@author: Rodrigo
+"""
+
+import numpy as np
+from scipy.signal import butter, filtfilt
+
+def ler_dados(nome_ficheiro):
+    with open(nome_ficheiro, 'r') as f:
+        linhas = f.readlines()[1:]  # ignora header
+    dados = []
+    for linha in linhas:
+        linha = linha.replace(',', '.')
+        valores = [float(x) for x in linha.split()]
+        dados.append(valores)
+    return np.array(dados)
+
+def filtro_passa_baixo(valores, fs, cutoff=0.3, ordem=2):
+    nyquist = 0.5 * fs
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(ordem, normal_cutoff, btype='low')
+    return filtfilt(b, a, valores)
+
+def aplicar_filtro_multicolunas(dados, fs, cutoff=0.3, ordem=2):
+    tempo = dados[:, 0]
+    valores = dados[:, 1:]  # todas as outras colunas
+    filtrados = np.zeros_like(valores)
+    for i in range(valores.shape[1]):
+        filtrados[:, i] = filtro_passa_baixo(valores[:, i], fs, cutoff, ordem)
+    return tempo, filtrados
+
+def guardar(nome_ficheiro, tempo, valores_filtrados):
+    # combina tempo e colunas filtradas
+    dados_guardar = np.column_stack((tempo, valores_filtrados))
+    np.savetxt(nome_ficheiro, dados_guardar, header='tempo ' + ' '.join([f'dado{i+1}' for i in range(valores_filtrados.shape[1])]), comments='')
+
+if __name__ == "__main__":
+    ficheiro = "nome_ficheiro.txt"
+    dados = ler_dados(ficheiro)
+    
+    tempo = dados[:, 0]
+    dt = np.mean(np.diff(tempo))
+    fs = 1 / dt
+    
+    tempo, dados_filtrados = aplicar_filtro_multicolunas(dados, fs, cutoff=0.5, ordem=2)
+    
+    guardar("Dados_Filtrados.txt", tempo, dados_filtrados)
+    
+    print("Filtro aplicado a todas as colunas com sucesso.")
