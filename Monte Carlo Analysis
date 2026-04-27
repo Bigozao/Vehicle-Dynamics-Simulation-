@@ -1,0 +1,890 @@
+# -*- coding: utf-8 -*-
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import matplotlib.patches as patches
+
+# =========================================================
+# CONFIG
+# =========================================================
+RUN_MONTE_CARLO = True
+
+N_MC = 120
+MC_SEED = 42
+
+DT_SINGLE = 0.001
+DT_MC     = 0.001
+T_TOTAL_SINGLE = 60.0
+T_TOTAL_MC     = 60.0
+
+RUN_SINGLE_AFTER_MC = True
+SINGLE_MODE = "nominal"   # "nominal" ou "sample"
+
+PLOTS_SINGLE = True
+ANIM_MPL_SINGLE = True
+
+PRINT_EVERY_N_STEPS_SINGLE = 1000
+PRINT_EVERY_N_STEPS_MC     = 0  # 0 = nunca
+
+# --- Diagnóstico ---
+FAIL_THRESHOLD_MAIN = 5.0                   # FALHA se e_ct_max > 5 m (plots + separação)
+FAIL_THRESHOLDS_ECTMAX = [5.0]              # para reportar prob. de falha
+DO_SCATTER_PLOTS = True
+SCATTER_ALPHA_OK = 0.55
+SCATTER_ALPHA_FAIL = 0.85
+
+# --- Completamento Figure-8 ---
+GATE_R_COMPLETION = 3.5
+MARKER_TOL = 40
+
+# --- Prints de influência ---
+TOPK_INFLUENCES = 12
+
+g = 9.81
+
+# =========================================================
+# INDEFINIÇÕES / INCERTEZAS (EDITA AQUI)
+# =========================================================
+UNC = {
+    # carro
+    "m":   ("triangular", 1128.0, 1158.0, 1188.0),     # kg
+    "Iz":  ("uniform",    1912.0*0.90, 1912.0*1.10),
+    "a":   ("normal",     1.066, 0.02),               # m
+    "b":   ("normal",     1.472, 0.02),               # m
+    "d_frente": ("normal", 1.5, 0.02),                # m
+    "d_tras":   ("normal", 1.5, 0.02),                # m
+    "h_CG": ("triangular", 0.45, 0.50, 0.57),          # m
+
+    # pneus: cornering stiffness correlacionado (lognormal)
+    "C_alpha_nom": 25000.0,
+    "C_alpha_cv":  0.25,
+    "C_alpha_rho": 0.85,
+
+    # atrito
+    "mu": ("normal_trunc", 1.10, 0.05, 1.00, 1.25),
+
+    # Pacejka simplificado
+    "C_pacejka": ("normal_trunc_pos", 1.8, 0.15),        # C>0
+    "E_pacejka": ("normal_trunc",     0.10, 0.03, -0.2, 0.8),
+}
+
+# =========================================================
+# Figura-8 (referência)
+# =========================================================
+R_figure8 = 20.0
+n_per_circle = 1600
+
+def build_figure8_waypoints(R=15.0, n_per_circle=1400):
+    th1 = np.linspace(0.0, 2*np.pi, n_per_circle, endpoint=False)
+    x1 = R * np.sin(th1)
+    y1 = -R + R * np.cos(th1)
+
+    phi = np.linspace(np.pi, -np.pi, n_per_circle, endpoint=False)
+    x2 = R * np.sin(phi)
+    y2 = +R + R * np.cos(phi)
+
+    x_ref = np.concatenate([x1, x2])
+    y_ref = np.concatenate([y1, y2])
+    return x_ref, y_ref
+
+x_ref, y_ref = build_figure8_waypoints(R_figure8, n_per_circle=n_per_circle)
+Nref = len(x_ref)
+idx_split = n_per_circle
+
+x_bot = x_ref[:idx_split].copy()
+y_bot = y_ref[:idx_split].copy()
+x_top = x_ref[idx_split:].copy()
+y_top = y_ref[idx_split:].copy()
+N_bot = len(x_bot)
+N_top = len(x_top)
+
+dx_bot = np.diff(x_bot, append=x_bot[0])
+dy_bot = np.diff(y_bot, append=y_bot[0])
+ds_bot = np.hypot(dx_bot, dy_bot)
+s_bot = np.concatenate([[0.0], np.cumsum(ds_bot[:-1])])
+len_bot = float(np.sum(ds_bot))
+
+dx_top = np.diff(x_top, append=x_top[0])
+dy_top = np.diff(y_top, append=y_top[0])
+ds_top = np.hypot(dx_top, dy_top)
+s_top = np.concatenate([[0.0], np.cumsum(ds_top[:-1])])
+len_top = float(np.sum(ds_top))
+
+def wrap_pi(a_):
+    return (a_ + np.pi) % (2*np.pi) - np.pi
+
+def advance_index_by_distance_branch(idx_ref, dist):
+    if dist <= 0:
+        return idx_ref
+
+    if idx_ref < idx_split:
+        i0 = idx_ref
+        st = (s_bot[i0] + dist) % len_bot
+        iloc = int(np.argmin(np.abs(s_bot - st)))
+        return iloc
+    else:
+        i0 = idx_ref - idx_split
+        st = (s_top[i0] + dist) % len_top
+        iloc = int(np.argmin(np.abs(s_top - st)))
+        return idx_split + iloc
+
+psi_bot = np.arctan2(np.roll(y_bot, -1) - y_bot, np.roll(x_bot, -1) - x_bot)
+psi_top = np.arctan2(np.roll(y_top, -1) - y_top, np.roll(x_top, -1) - x_top)
+psi_ref_path = np.concatenate([psi_bot, psi_top])
+
+# =========================================================
+# Pneus
+# =========================================================
+def pacejka_lateral(alpha, Fz, mu, C, E, C_alpha):
+    D = mu * Fz
+    if D < 1e-3:
+        return 0.0
+    B = C_alpha / (C * D)
+    return D * np.sin(C * np.arctan(B*alpha - E*(B*alpha - np.arctan(B*alpha))))
+
+# =========================================================
+# Helpers
+# =========================================================
+def update_idx_ref_branch_cost(idx_ref, x, y, yaw,
+                               search_fwd=450, search_back=120,
+                               w_dist=1.0, w_head=14.0,
+                               allow_switch_dist=3.5, e_ct_now=0.0):
+    allow_switch = (np.hypot(x, y) < allow_switch_dist)
+
+    if allow_switch:
+        offsets = np.arange(-search_back, search_fwd)
+        idxs = (idx_ref + offsets) % Nref
+    else:
+        if idx_ref < idx_split:
+            i0 = idx_ref
+            offs = np.arange(-search_back, search_fwd) if (e_ct_now > 3.0) else np.arange(0, search_fwd)
+            idxs_local = (i0 + offs) % N_bot
+            idxs = idxs_local
+        else:
+            i0 = idx_ref - idx_split
+            offs = np.arange(-search_back, search_fwd) if (e_ct_now > 3.0) else np.arange(0, search_fwd)
+            idxs_local = (i0 + offs) % N_top
+            idxs = idx_split + idxs_local
+
+    dx = x_ref[idxs] - x
+    dy = y_ref[idxs] - y
+    dist2 = dx*dx + dy*dy
+    dpsi = wrap_pi(psi_ref_path[idxs] - yaw)
+    cost = w_dist * dist2 + w_head * (dpsi*dpsi)
+    return int(idxs[int(np.argmin(cost))])
+
+def pick_lookahead_robusto(idx_ref, x, y, yaw, Ld, idx_look_prev,
+                           x_b_min_ok=0.5,
+                           candidates=(1.0, 1.2, 1.5, 1.8, 2.2, 2.8)):
+    best = None
+    for mult in candidates:
+        idx = advance_index_by_distance_branch(idx_ref, mult * Ld)
+        dx, dy = x_ref[idx] - x, y_ref[idx] - y
+        x_b =  np.cos(yaw)*dx + np.sin(yaw)*dy
+        y_b = -np.sin(yaw)*dx + np.cos(yaw)*dy
+
+        if best is None or x_b > best[1]:
+            best = (idx, x_b, y_b)
+
+        if x_b > x_b_min_ok:
+            return idx, x_b, y_b, True
+
+    idx, x_b, y_b = best
+    if x_b <= 0.0:
+        return idx_ref, x_b, 0.0, False
+    return idx, x_b, y_b, False
+
+# =========================================================
+# Sampling (Monte Carlo)
+# =========================================================
+def sample_trunc_normal(rng, mean, std, lo, hi, size=None):
+    if size is None:
+        while True:
+            x = rng.normal(mean, std)
+            if lo <= x <= hi:
+                return x
+    out = np.empty(size, dtype=float)
+    filled = 0
+    while filled < size:
+        x = rng.normal(mean, std, size=size)
+        ok = (x >= lo) & (x <= hi)
+        n_ok = int(np.sum(ok))
+        if n_ok > 0:
+            take = min(n_ok, size - filled)
+            out[filled:filled+take] = x[ok][:take]
+            filled += take
+    return out
+
+def sample_params_one(rng):
+    def draw(spec):
+        kind = spec[0]
+        if kind == "fixed":
+            return float(spec[1])
+        if kind == "normal":
+            _, mu_, sig_ = spec
+            return float(rng.normal(mu_, sig_))
+        if kind == "uniform":
+            _, lo, hi = spec
+            return float(rng.uniform(lo, hi))
+        if kind == "triangular":
+            _, lo, mode, hi = spec
+            return float(rng.triangular(lo, mode, hi))
+        if kind == "normal_trunc_pos":
+            _, mu_, sig_ = spec
+            return float(sample_trunc_normal(rng, mu_, sig_, 1e-12, np.inf))
+        if kind == "normal_trunc":
+            _, mu_, sig_, lo, hi = spec
+            return float(sample_trunc_normal(rng, mu_, sig_, lo, hi))
+        raise ValueError(f"Distribuição desconhecida: {kind}")
+
+    m  = draw(UNC["m"])
+    Iz = draw(UNC["Iz"])
+    a  = draw(UNC["a"])
+    b  = draw(UNC["b"])
+    d_frente = draw(UNC["d_frente"])
+    d_tras   = draw(UNC["d_tras"])
+    h_CG     = draw(UNC["h_CG"])
+
+    mu = draw(UNC["mu"])
+    C_pacejka = draw(UNC["C_pacejka"])
+    E_pacejka = draw(UNC["E_pacejka"])
+
+    # C_alpha correlacionado (lognormal)
+    C_nom = float(UNC["C_alpha_nom"])
+    cv    = float(UNC["C_alpha_cv"])
+    rho   = float(UNC["C_alpha_rho"])
+
+    sigma_ln = np.sqrt(np.log(1 + cv**2))
+    mu_ln    = np.log(C_nom) - 0.5*sigma_ln**2
+
+    z1 = rng.standard_normal()
+    z2 = rho*z1 + np.sqrt(max(1.0 - rho*rho, 0.0))*rng.standard_normal()
+
+    C_alpha_front = float(np.exp(mu_ln + sigma_ln*z1))
+    C_alpha_rear  = float(np.exp(mu_ln + sigma_ln*z2))
+
+    return {
+        "m": m, "Iz": Iz, "a": a, "b": b,
+        "d_frente": d_frente, "d_tras": d_tras,
+        "h_CG": h_CG,
+        "C_alpha_front": C_alpha_front,
+        "C_alpha_rear": C_alpha_rear,
+        "mu": mu,
+        "C_pacejka": C_pacejka,
+        "E_pacejka": E_pacejka,
+    }
+
+def nominal_params():
+    return {
+        "m": 1158.0,
+        "Iz": 1912.0,
+        "a": 1.066,
+        "b": 1.472,
+        "d_frente": 1.5,
+        "d_tras": 1.5,
+        "h_CG": 0.50,
+        "C_alpha_front": 25000.0,
+        "C_alpha_rear": 25000.0,
+        "mu": 1.10,
+        "C_pacejka": 1.8,
+        "E_pacejka": 0.1,
+    }
+
+# =========================================================
+# Simulação
+# =========================================================
+def simulate_once(params, dt=0.001, t_total=60.0, do_log=False, verbose_every=0, gate_r=3.5, marker_tol=40):
+    m  = float(params["m"])
+    Iz = float(params["Iz"])
+    a  = float(params["a"])
+    b  = float(params["b"])
+    L  = a + b
+    d_frente = float(params["d_frente"])
+    d_tras   = float(params["d_tras"])
+    h_CG     = float(params["h_CG"])
+
+    C_alpha_front = float(params["C_alpha_front"])
+    C_alpha_rear  = float(params["C_alpha_rear"])
+    mu = float(params["mu"])
+    C_pacejka = float(params["C_pacejka"])
+    E_pacejka = float(params["E_pacejka"])
+
+    # limites / controlos
+    delta_max_rad = np.deg2rad(25.0)
+    tau_steer = 0.03
+    use_delta_rate_limit = True
+    delta_rate_max = np.deg2rad(600.0)
+
+    vx_target_nom = 12.0
+    Kp_vx = 1.2
+    ax_lim_pos = 5.0
+    ax_lim_neg = 7.0
+
+    Ld0 = 3.0
+    Ld_gain = 0.80
+    alpha_max = np.deg2rad(50.0)
+
+    ay_margin = 0.90
+    ay_max_base = ay_margin * mu * g
+
+    vx_target_f = vx_target_nom
+    tau_v = 0.40
+
+    k_fb = 0.80
+    k_psi = 1.10
+    k_w  = 0.35
+    dkappa_w_max = 0.35
+    kappa_abs_nom = 1.0 / R_figure8
+
+    e_ct_recover = 8.0
+    vx_recover   = 2.0
+    x_b_min_ok   = 0.5
+
+    # distribuição estática por eixo
+    Wf = (b / L) * m * g
+    Wr = (a / L) * m * g
+    frac_f = Wf / (Wf + Wr)
+    frac_r = Wr / (Wf + Wr)
+
+    # estados iniciais
+    x, y = 0.0, 0.0
+    vx, vy = 0.1, 0.0
+    yaw, w = 0.0, 0.0
+    ax = 0.0
+    delta = 0.0
+
+    ay_for_load = 0.0
+    idx_ref = int(np.argmin((x_ref-x)**2 + (y_ref-y)**2))
+    idx_look_prev = idx_ref
+
+    # contadores antigos (mantidos)
+    time_bottom = 0.0
+    time_top    = 0.0
+    time_gate   = 0.0
+
+    # logs opcionais
+    if do_log:
+        traj_x, traj_y = [], []
+        vx_list, vy_list, ax_list = [], [], []
+        yaw_list, w_list = [], []
+        delta_list = []
+        e_ct_list = []
+
+    # métricas
+    e_ct_max = 0.0
+    e_ct_rms_acc = 0.0
+    e_ct_rms_n = 0
+    n_fail = 0
+    n_recover = 0
+
+    # tempo Figure-8
+    started = False
+    completed = False
+    t_start = 0.0
+    time_figure8 = float("nan")
+
+    bottom_marker_idx = int(idx_split // 2)
+    top_marker_idx    = int(idx_split + (idx_split // 2))
+    hit_bottom = False
+    hit_top = False
+
+    in_gate_prev = (np.hypot(x, y) < gate_r)
+
+    n_steps = int(np.floor(t_total / dt))
+    for i in range(n_steps):
+        tt = i * dt
+
+        if not np.isfinite(x) or not np.isfinite(y) or abs(x) > 1e4 or abs(y) > 1e4:
+            n_fail = 1
+            break
+
+        e_ct_now = float(np.hypot(x_ref[idx_ref] - x, y_ref[idx_ref] - y))
+        idx_ref = update_idx_ref_branch_cost(idx_ref, x, y, yaw, e_ct_now=e_ct_now, allow_switch_dist=gate_r)
+        e_ct = float(np.hypot(x_ref[idx_ref] - x, y_ref[idx_ref] - y))
+
+        e_ct_max = max(e_ct_max, e_ct)
+        e_ct_rms_acc += e_ct*e_ct
+        e_ct_rms_n += 1
+
+        # tempo sem gate (contadores antigos)
+        in_gate = (np.hypot(x, y) < gate_r)
+        if in_gate:
+            time_gate += dt
+        else:
+            if idx_ref < idx_split:
+                time_bottom += dt
+            else:
+                time_top += dt
+
+        # completamento Figure-8
+        if (not started) and in_gate_prev and (not in_gate):
+            started = True
+            t_start = tt
+            hit_bottom = False
+            hit_top = False
+
+        if started and (not in_gate):
+            if (idx_ref < idx_split) and (abs(idx_ref - bottom_marker_idx) <= marker_tol):
+                hit_bottom = True
+            if (idx_ref >= idx_split) and (abs(idx_ref - top_marker_idx) <= marker_tol):
+                hit_top = True
+
+        if started and (not in_gate_prev) and in_gate and hit_bottom and hit_top:
+            completed = True
+            time_figure8 = tt - t_start
+            break
+
+        in_gate_prev = in_gate
+
+        # speed planning
+        ay_cap = np.sqrt(max(ay_max_base*ay_max_base - ax*ax, 0.0))
+        v_lim_path = np.sqrt(ay_cap / (kappa_abs_nom + 1e-6))
+
+        if e_ct > 1.0:  v_lim_path *= 0.90
+        if e_ct > 2.0:  v_lim_path *= 0.80
+        if e_ct > 3.0:  v_lim_path *= 0.65
+        if e_ct > 5.0:  v_lim_path *= 0.45
+        if e_ct > 10.0: v_lim_path *= 0.25
+        if e_ct > 20.0: v_lim_path *= 0.12
+
+        vx_target_dyn = min(vx_target_nom, v_lim_path)
+
+        if e_ct > e_ct_recover:
+            vx_target_dyn = min(vx_target_dyn, vx_recover)
+            n_recover += 1
+
+        vx_target_f += (vx_target_dyn - vx_target_f) * (dt / tau_v)
+        vx_target_dyn = vx_target_f
+
+        # longitudinal
+        erro_vx = vx_target_dyn - vx
+        ax_cmd = Kp_vx * erro_vx
+        ax = float(np.clip(ax_cmd, -ax_lim_neg, ax_lim_pos))
+        vx += ax * dt
+
+        # lookahead
+        Ld = max(Ld0 + Ld_gain * vx, 2.5)
+        idx_look, x_b, y_b, ok = pick_lookahead_robusto(idx_ref, x, y, yaw, Ld, idx_look_prev, x_b_min_ok=x_b_min_ok)
+        if ok:
+            idx_look_prev = idx_look
+
+        denom = max(Ld*Ld, 1e-6)
+        kappa_pp = 2.0 * y_b / denom
+        kappa_ff = (-1.0 / R_figure8) if (idx_ref < idx_split) else (+1.0 / R_figure8)
+
+        psi_ref = float(psi_ref_path[idx_ref])
+        e_psi = wrap_pi(psi_ref - yaw)
+        kappa_psi = k_psi * np.tan(e_psi) / max(vx, 2.0)
+
+        kappa_cmd = kappa_ff + k_fb * kappa_pp + kappa_psi
+
+        w_ref = vx * kappa_cmd
+        dkappa_w = k_w * (w_ref - w) / max(vx, 2.0)
+        dkappa_w = float(np.clip(dkappa_w, -dkappa_w_max, dkappa_w_max))
+        kappa_cmd += dkappa_w
+
+        kappa_lim = ay_cap / max(vx*vx, 2.0*2.0)
+        kappa_cmd = float(np.clip(kappa_cmd, -kappa_lim, kappa_lim))
+
+        delta_ref = np.arctan(L * kappa_cmd)
+        delta_ref = float(np.clip(delta_ref, -delta_max_rad, delta_max_rad))
+
+        # actuador
+        delta_dot = (delta_ref - delta) / tau_steer
+        if use_delta_rate_limit:
+            delta_dot = np.clip(delta_dot, -delta_rate_max, delta_rate_max)
+        delta += float(delta_dot * dt)
+        delta = float(np.clip(delta, -delta_max_rad, delta_max_rad))
+
+        # Ackermann
+        if abs(delta) > 1e-6:
+            R_geom = L / np.tan(delta)
+            delta_FL = np.arctan(L / (R_geom - np.sign(delta) * d_frente/2))
+            delta_FR = np.arctan(L / (R_geom + np.sign(delta) * d_frente/2))
+        else:
+            delta_FL = 0.0
+            delta_FR = 0.0
+
+        # slip angles
+        alpha_FL = delta_FL - np.arctan2(vy + a*w, vx - w*d_frente/2)
+        alpha_FR = delta_FR - np.arctan2(vy + a*w, vx + w*d_frente/2)
+        alpha_RL = -np.arctan2(vy - b*w, vx - w*d_tras/2)
+        alpha_RR = -np.arctan2(vy - b*w, vx + w*d_tras/2)
+
+        alpha_FL = np.clip(alpha_FL, -alpha_max, alpha_max)
+        alpha_FR = np.clip(alpha_FR, -alpha_max, alpha_max)
+        alpha_RL = np.clip(alpha_RL, -alpha_max, alpha_max)
+        alpha_RR = np.clip(alpha_RR, -alpha_max, alpha_max)
+
+        # cargas verticais
+        Fz_FL_static = (b / L) * m * g / 2.0
+        Fz_FR_static = (b / L) * m * g / 2.0
+        Fz_RL_static = (a / L) * m * g / 2.0
+        Fz_RR_static = (a / L) * m * g / 2.0
+
+        deltaFz_long = (h_CG / L) * m * ax
+        deltaFz_lat_front = frac_f * (m * ay_for_load * h_CG) / d_frente
+        deltaFz_lat_rear  = frac_r * (m * ay_for_load * h_CG) / d_tras
+
+        Fz_FL = Fz_FL_static - deltaFz_long/2.0 - deltaFz_lat_front/2.0
+        Fz_FR = Fz_FR_static - deltaFz_long/2.0 + deltaFz_lat_front/2.0
+        Fz_RL = Fz_RL_static + deltaFz_long/2.0 - deltaFz_lat_rear/2.0
+        Fz_RR = Fz_RR_static + deltaFz_long/2.0 + deltaFz_lat_rear/2.0
+
+        Fz_FL = max(Fz_FL, 0.0)
+        Fz_FR = max(Fz_FR, 0.0)
+        Fz_RL = max(Fz_RL, 0.0)
+        Fz_RR = max(Fz_RR, 0.0)
+
+        # forças laterais
+        FyFL = pacejka_lateral(alpha_FL, Fz_FL, mu, C_pacejka, E_pacejka, C_alpha_front)
+        FyFR = pacejka_lateral(alpha_FR, Fz_FR, mu, C_pacejka, E_pacejka, C_alpha_front)
+        FyRL = pacejka_lateral(alpha_RL, Fz_RL, mu, C_pacejka, E_pacejka, C_alpha_rear)
+        FyRR = pacejka_lateral(alpha_RR, Fz_RR, mu, C_pacejka, E_pacejka, C_alpha_rear)
+
+        Fy_total = FyFL + FyFR + FyRL + FyRR
+
+        # dinâmica
+        dot_vy = Fy_total / m - vx * w
+        vy += dot_vy * dt
+
+        dot_w = (
+            a * (FyFL + FyFR)
+            - b * (FyRL + FyRR)
+            + (d_frente/2.0) * (FyFR - FyFL)
+            + (d_tras/2.0)   * (FyRR - FyRL)
+        ) / Iz
+
+        w += dot_w * dt
+        yaw += w * dt
+        yaw = wrap_pi(yaw)
+
+        # posição
+        x += (vx * np.cos(yaw) - vy * np.sin(yaw)) * dt
+        y += (vx * np.sin(yaw) + vy * np.cos(yaw)) * dt
+
+        ay_for_load = Fy_total / m
+
+        if verbose_every and (i % verbose_every == 0):
+            print(f"t={tt:.1f}s | vx={vx:.2f} | e_ct={e_ct:.2f} | mu={mu:.3f}")
+
+        if do_log:
+            traj_x.append(x); traj_y.append(y)
+            vx_list.append(vx); vy_list.append(vy); ax_list.append(ax)
+            yaw_list.append(yaw); w_list.append(w)
+            delta_list.append(np.rad2deg(delta))
+            e_ct_list.append(e_ct)
+
+    e_ct_rms = float(np.sqrt(e_ct_rms_acc / max(e_ct_rms_n, 1)))
+
+    # fail inclui timeout (não completou)
+    fail = int(n_fail or (not completed))
+
+    metrics = {
+        "fail": int(fail),
+        "time_bottom": float(time_bottom),
+        "time_top": float(time_top),
+        "time_gate": float(time_gate),
+        "time_total_nogate": float(time_bottom + time_top),
+
+        "completed": int(completed),
+        "time_figure8": float(time_figure8) if np.isfinite(time_figure8) else float("nan"),
+
+        "e_ct_max": float(e_ct_max),
+        "e_ct_rms": float(e_ct_rms),
+        "recover_frac": float(n_recover / max(n_steps, 1)),
+
+        # parâmetros para análise
+        "mu": float(mu),
+        "h_CG": float(h_CG),
+        "Caf": float(C_alpha_front),
+        "Car": float(C_alpha_rear),
+        "Iz": float(Iz),
+        "m": float(m),
+
+        # extras
+        "a": float(a),
+        "b": float(b),
+        "d_frente": float(d_frente),
+        "d_tras": float(d_tras),
+        "C_pacejka": float(C_pacejka),
+        "E_pacejka": float(E_pacejka),
+    }
+
+    logs = None
+    if do_log:
+        logs = {
+            "traj_x": np.array(traj_x),
+            "traj_y": np.array(traj_y),
+            "vx": np.array(vx_list),
+            "vy": np.array(vy_list),
+            "ax": np.array(ax_list),
+            "yaw": np.array(yaw_list),
+            "w": np.array(w_list),
+            "delta_deg": np.array(delta_list),
+            "e_ct": np.array(e_ct_list),
+            "t": np.arange(0.0, len(traj_x)*dt, dt),
+        }
+
+    return metrics, logs
+
+# =========================================================
+# Utilitários de análise
+# =========================================================
+def summarize_percentiles(arr, name):
+    arr = np.asarray(arr, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        print(f"{name}: (sem dados finitos)")
+        return
+    q = np.percentile(arr, [2.5, 10, 50, 90, 97.5])
+    print(f"{name}:  P2.5={q[0]:.3f} | P10={q[1]:.3f} | P50={q[2]:.3f} | P90={q[3]:.3f} | P97.5={q[4]:.3f}")
+
+def corr(x, y):
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if x.size < 3 or y.size < 3:
+        return 0.0
+    if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(x, y)[0, 1])  # Pearson
+
+def print_fail_stats(emax, thresholds, label="e_ct_max"):
+    n = len(emax)
+    print("\n--- Probabilidade de falha (por limiar) ---")
+    for th in thresholds:
+        k = int(np.sum(emax > th))
+        p = k / max(n, 1)
+        se = np.sqrt(max(p*(1-p)/max(n,1), 0.0))
+        print(f"{label} > {th:.1f} m : {k}/{n} = {100*p:.1f}%  (±~{100*1.96*se:.1f} pp)")
+
+def scatter_ok_fail(x, y, fail_mask, xlabel, ylabel, title):
+    x = np.asarray(x); y = np.asarray(y); fail_mask = np.asarray(fail_mask, dtype=bool)
+    plt.figure(figsize=(8.5, 5.2))
+    plt.scatter(x[~fail_mask], y[~fail_mask], s=20, alpha=SCATTER_ALPHA_OK, label="OK")
+    plt.scatter(x[fail_mask],  y[fail_mask],  s=28, alpha=SCATTER_ALPHA_FAIL, label="FALHA")
+    plt.grid(True)
+    plt.xlabel(xlabel); plt.ylabel(ylabel)
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+def print_top_influences(y, yname, params_dict, topk=10):
+    y = np.asarray(y, dtype=float)
+    items = []
+    for k, x in params_dict.items():
+        x = np.asarray(x, dtype=float)
+        r = corr(x, y)
+        items.append((k, abs(r), r))
+    items.sort(key=lambda t: t[1], reverse=True)
+    print(f"\nTop influências (|corr| vs {yname}):")
+    for k, ar, r in items[:topk]:
+        print(f"    {k}: {ar:.3f}  (r={r:+.3f})")
+
+def filter_params(params_dict, mask):
+    mask = np.asarray(mask, dtype=bool)
+    return {k: np.asarray(v)[mask] for k, v in params_dict.items()}
+
+# =========================================================
+# Execução: Monte Carlo + análise nível acima
+# =========================================================
+if RUN_MONTE_CARLO:
+    rng = np.random.default_rng(MC_SEED)
+    results = []
+
+    for _ in range(N_MC):
+        p = sample_params_one(rng)
+        met, _ = simulate_once(
+            p, dt=DT_MC, t_total=T_TOTAL_MC, do_log=False,
+            verbose_every=PRINT_EVERY_N_STEPS_MC,
+            gate_r=GATE_R_COMPLETION,
+            marker_tol=MARKER_TOL
+        )
+        results.append(met)
+
+    # "OK de simulação" = completou e não rebentou
+    ok_idx = [i for i, r in enumerate(results) if (r["fail"] == 0 and r["completed"] == 1)]
+    fail_idx = [i for i, r in enumerate(results) if not (r["fail"] == 0 and r["completed"] == 1)]
+
+    print("\n================= MONTE CARLO =================")
+    print(f"Runs: {len(results)} | OK (completou 1 Figure-8): {len(ok_idx)} | FAIL (numérico/timeout): {len(fail_idx)}")
+    if len(ok_idx) == 0:
+        raise RuntimeError("Nenhuma run completou 1 Figure-8 dentro do tempo total.")
+
+    # métricas base (apenas runs que completaram)
+    time_fig8 = np.array([results[i]["time_figure8"] for i in ok_idx])
+    emax = np.array([results[i]["e_ct_max"] for i in ok_idx])
+    erms = np.array([results[i]["e_ct_rms"] for i in ok_idx])
+    recf = np.array([results[i]["recover_frac"] for i in ok_idx])
+
+    summarize_percentiles(time_fig8, "Tempo Figure-8 (completamento) [s]")
+    summarize_percentiles(emax, "e_ct max [m]")
+    summarize_percentiles(erms, "e_ct RMS [m]")
+    summarize_percentiles(recf, "Frac. em recovery [-]")
+
+    # falha por limiar em e_ct_max (entre os que completaram)
+    print_fail_stats(emax, FAIL_THRESHOLDS_ECTMAX, label="e_ct_max")
+
+    # dicionário de parâmetros para influência (12 variáveis)
+    params_for_influence = {
+        "mu": np.array([results[i]["mu"] for i in ok_idx]),
+        "m":  np.array([results[i]["m"]  for i in ok_idx]),
+        "Iz": np.array([results[i]["Iz"] for i in ok_idx]),
+        "h_CG": np.array([results[i]["h_CG"] for i in ok_idx]),
+        "Caf": np.array([results[i]["Caf"] for i in ok_idx]),
+        "Car": np.array([results[i]["Car"] for i in ok_idx]),
+        "a": np.array([results[i]["a"] for i in ok_idx]),
+        "b": np.array([results[i]["b"] for i in ok_idx]),
+        "d_frente": np.array([results[i]["d_frente"] for i in ok_idx]),
+        "d_tras":   np.array([results[i]["d_tras"]   for i in ok_idx]),
+        "C_pacejka": np.array([results[i]["C_pacejka"] for i in ok_idx]),
+        "E_pacejka": np.array([results[i]["E_pacejka"] for i in ok_idx]),
+    }
+
+    # -----------------------------------------------------
+    # (NÍVEL ACIMA) separação por tracking
+    # -----------------------------------------------------
+    track_ok = (emax <= FAIL_THRESHOLD_MAIN)
+    track_fail = ~track_ok
+    n_okt = int(np.sum(track_ok))
+    n_flt = int(np.sum(track_fail))
+    n_tot = int(len(emax))
+
+    print("\n================= SEPARAÇÃO POR TRACKING =================")
+    print(f"Tracking OK (e_ct_max <= {FAIL_THRESHOLD_MAIN:.1f} m): {n_okt}/{n_tot} = {100*n_okt/max(n_tot,1):.1f}%")
+    print(f"Tracking FAIL (e_ct_max >  {FAIL_THRESHOLD_MAIN:.1f} m): {n_flt}/{n_tot} = {100*n_flt/max(n_tot,1):.1f}%")
+
+    # percentis por regime
+    summarize_percentiles(time_fig8[track_ok],  f"Tempo Figure-8 | tracking OK [s]")
+    summarize_percentiles(time_fig8[track_fail], f"Tempo Figure-8 | tracking FAIL [s]")
+    summarize_percentiles(emax[track_ok],       f"e_ct_max | tracking OK [m]")
+    summarize_percentiles(emax[track_fail],     f"e_ct_max | tracking FAIL [m]")
+
+    # top influências globais (misturado) — útil mas cuidado
+    print_top_influences(time_fig8, "tempo Figure-8 (todos os que completaram)", params_for_influence, topk=TOPK_INFLUENCES)
+    print_top_influences(emax, "e_ct_max (todos os que completaram)", params_for_influence, topk=TOPK_INFLUENCES)
+
+    # top influências por regime (isto é o que deves usar na tese)
+    params_ok = filter_params(params_for_influence, track_ok)
+    params_fl = filter_params(params_for_influence, track_fail)
+
+    if n_okt >= 5:
+        print_top_influences(time_fig8[track_ok], "tempo Figure-8 | tracking OK", params_ok, topk=TOPK_INFLUENCES)
+        print_top_influences(emax[track_ok], "e_ct_max | tracking OK", params_ok, topk=TOPK_INFLUENCES)
+    else:
+        print("\n[AVISO] Poucos pontos em tracking OK para correlações estáveis.")
+
+    if n_flt >= 5:
+        print_top_influences(time_fig8[track_fail], "tempo Figure-8 | tracking FAIL", params_fl, topk=TOPK_INFLUENCES)
+        print_top_influences(emax[track_fail], "e_ct_max | tracking FAIL", params_fl, topk=TOPK_INFLUENCES)
+    else:
+        print("\n[AVISO] Poucos pontos em tracking FAIL para correlações estáveis (normal em MC pequeno).")
+
+    # máscara para cores nos scatter
+    fail_mask_main = track_fail
+
+    # -----------------------------------------------------
+    # Histogramas (globais)
+    # -----------------------------------------------------
+    plt.figure(figsize=(10, 4))
+    plt.hist(time_fig8[np.isfinite(time_fig8)], bins=25)
+    plt.grid(True)
+    plt.title("Monte Carlo: Tempo Figure-8 (completamento)")
+    plt.xlabel("s"); plt.ylabel("contagem")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10, 4))
+    plt.hist(emax, bins=25)
+    plt.grid(True)
+    plt.title("Monte Carlo: e_ct máximo (todos os que completaram)")
+    plt.xlabel("m"); plt.ylabel("contagem")
+    plt.tight_layout()
+    plt.show()
+
+    # (extra útil) histogramas por regime
+    plt.figure(figsize=(10, 4))
+    plt.hist(emax[track_ok], bins=20, alpha=0.7, label="tracking OK")
+    plt.hist(emax[track_fail], bins=20, alpha=0.7, label="tracking FAIL")
+    plt.grid(True)
+    plt.title("Monte Carlo: e_ct_max por regime (OK vs FAIL)")
+    plt.xlabel("m"); plt.ylabel("contagem")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # 24 scatterplots: 12 variáveis vs e_ct_max + 12 vs tempo
+    # -----------------------------------------------------
+    if DO_SCATTER_PLOTS:
+        crit = f"FALHA se e_ct_max > {FAIL_THRESHOLD_MAIN:.1f} m"
+
+        vars_scatter = {
+            "mu": (params_for_influence["mu"], "μ [-]"),
+            "m":  (params_for_influence["m"], "m [kg]"),
+            "Iz": (params_for_influence["Iz"], "Iz [kg·m²]"),
+            "h_CG": (params_for_influence["h_CG"], "h_CG [m]"),
+            "Caf": (params_for_influence["Caf"], "C_alpha_frente (Caf)"),
+            "Car": (params_for_influence["Car"], "C_alpha_tras (Car)"),
+            "a": (params_for_influence["a"], "a [m]"),
+            "b": (params_for_influence["b"], "b [m]"),
+            "d_frente": (params_for_influence["d_frente"], "d_frente [m]"),
+            "d_tras":   (params_for_influence["d_tras"],   "d_tras [m]"),
+            "C_pacejka": (params_for_influence["C_pacejka"], "C_pacejka (C)"),
+            "E_pacejka": (params_for_influence["E_pacejka"], "E_pacejka (E)"),
+        }
+
+        targets = [
+            ("e_ct_max [m]", emax, "e_ct_max"),
+            ("tempo Figure-8 [s]", time_fig8, "tempo Figure-8"),
+        ]
+
+        for ylab, yvec, yname in targets:
+            for key, (xvec, xlab) in vars_scatter.items():
+                scatter_ok_fail(
+                    xvec, yvec, fail_mask_main,
+                    xlabel=xlab,
+                    ylabel=ylab,
+                    title=f"{yname} vs {key} ({crit})"
+                )
+
+    # single run opcional
+    if RUN_SINGLE_AFTER_MC:
+        if SINGLE_MODE == "nominal":
+            p_single = nominal_params()
+        else:
+            p_single = sample_params_one(np.random.default_rng(MC_SEED + 999))
+else:
+    p_single = nominal_params()
+
+# =========================================================
+# Single run com plots/animação (opcional)
+# =========================================================
+if RUN_SINGLE_AFTER_MC or (not RUN_MONTE_CARLO):
+    met, logs = simulate_once(
+        p_single, dt=DT_SINGLE, t_total=T_TOTAL_SINGLE,
+        do_log=True, verbose_every=PRINT_EVERY_N_STEPS_SINGLE,
+        gate_r=GATE_R_COMPLETION,
+        marker_tol=MARKER_TOL
+    )
+
+    print("\n================= SINGLE RUN =================")
+    print("Params usados:")
+    for k in ["m","Iz","a","b","d_frente","d_tras","h_CG","C_alpha_front","C_alpha_rear","mu","C_pacejka","E_pacejka"]:
+        print(f"  {k}: {p_single[k]}")
+
+    print("\nMétricas:")
+    for k in ["time_figure8","completed","e_ct_max","e_ct_rms","recover_frac","fail"]:
+        print(f"  {k}: {met[k]}")
+
+    if PLOTS_SINGLE and logs is not None:
+        traj_x = logs["traj_x"]; traj_y = logs["traj_y"]
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(traj_x, traj_y, lw=2, label='traj')
+        plt.plot(x_ref, y_ref, lw=1, alpha=0.5, label='ref')
+        plt.axis('equal'); plt.grid(True)
+        plt.title('Trajetória do veículo vs referência (Figura-8)')
+        plt.xlabel('X [m]'); plt.ylabel('Y [m]')
+        plt.legend(); plt.tight_layout(); plt.show()
