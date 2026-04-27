@@ -1,0 +1,964 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Apr 20 17:47:56 2026
+
+@author: Rodrigo
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import matplotlib.patches as patches
+from matplotlib.transforms import Affine2D
+
+# =========================================================
+# 1) FUNÇÕES AUXILIARES
+# =========================================================
+def pacejka_lateral(alpha, Fz, mu, C, E, C_alpha):
+    """
+    Modelo lateral tipo Pacejka simplificado.
+    Recebe:
+        alpha   -> slip angle [rad]
+        Fz      -> carga vertical [N]
+        mu, C, E, C_alpha -> parâmetros do pneu
+    Devolve:
+        força lateral Fy [N]
+    """
+    D = mu * Fz
+    if D < 1e-6:
+        return 0.0
+
+    B = C_alpha / (C * D)
+    return D * np.sin(C * np.arctan(B * alpha - E * (B * alpha - np.arctan(B * alpha))))
+
+
+def wrap_pi(angle):
+    """
+    Coloca um ângulo no intervalo [-pi, pi].
+    """
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+# =========================================================
+# 2) PARÂMETROS DO VEÍCULO
+# =========================================================
+m = 1690.0
+#m = 1316.0
+
+a = 1.181  # Veículo Elétrico
+#a = 1.033 # Veículo Combustão
+
+b = 1.439  # Veículo Elétrico
+#b = 1.587 # Veículo Combustão
+
+L = a + b
+
+d_frente = 1.54
+d_tras = 1.54
+
+g = 9.81
+
+h_CG = 0.528  # Veículo Elétrico
+#h_CG = 0.483 # Veículo Combustão
+
+m_f = m * b / L
+m_r = m * a / L
+
+# Momento de inércia em yaw
+Iz = m * a * b + 0.25 * m_f * d_frente**2 + 0.25 * m_r * d_tras**2
+
+
+# =========================================================
+# 3) PARÂMETROS DOS PNEUS
+# =========================================================
+# Cornering stiffness por pneu [N/rad]
+C_alpha_front = 100000.0
+C_alpha_rear = 100000.0
+
+mu = 1.1
+C_pacejka = 1.8
+E_pacejka = 0.1
+
+
+# =========================================================
+# 4) INPUTS DO ENSAIO ISO 4138 — MÉTODO 2
+# =========================================================
+delta_max_rad = np.deg2rad(25.0)
+tau_steer = 0.03
+
+use_delta_rate_limit = True
+delta_rate_max = np.deg2rad(600.0)
+
+R0 = 7.5 #Raio Alvo
+
+# Ângulo médio nas rodas dianteiras
+delta_const = np.arctan(L / R0)
+
+turn_direction = +1.0 # +1 esquerda, -1 direita
+delta_const *= turn_direction
+
+vx_start = 3.0
+vx_max = 40.0
+
+# Rampa de velocidade limitada aproximadamente por ay_dot
+ay_dot_target = 0.24   # [m/s²/s]  
+dvdt_cap = 1.80        # [m/s²]    
+t_settle = 0.5
+
+# Controlo longitudinal
+Kp_vx = 3.6
+ax_lim_pos = 6.0
+ax_lim_neg = 7.0
+
+
+# =========================================================
+# 5) CRITÉRIOS DE FIM DO ENSAIO
+# =========================================================
+use_beta_growth_criterion = True
+beta_abs_min = np.deg2rad(8.0)
+beta_dot_lim = np.deg2rad(12.0)
+tau_beta_dot = 0.25
+hold_time_beta = 0.20
+
+use_radius_open_criterion = True
+R_ratio_lim = 1.25
+tau_R_ratio = 0.50
+hold_time_R = 0.50
+chi_dot_min_for_R = 0.05
+V_min_for_criteria = 5.0
+t_criteria_start = t_settle + 2.0
+
+# Guardas numéricas
+nan_guard = True
+vx_min_guard = 0.2
+alpha_guard = np.deg2rad(45.0)
+
+
+# =========================================================
+# 6) DISTRIBUIÇÃO ESTÁTICA DE CARGA
+# =========================================================
+Wf = (b / L) * m * g
+Wr = (a / L) * m * g
+
+frac_f = Wf / (Wf + Wr)
+frac_r = Wr / (Wf + Wr)
+
+
+# =========================================================
+# 7) PARÂMETROS DE SIMULAÇÃO
+# =========================================================
+dt = 0.001
+t_total = 200.0
+t = np.arange(0.0, t_total, dt)
+
+
+# =========================================================
+# 8) ESTADOS INICIAIS
+# =========================================================
+x = 0.0
+y = 0.0
+
+vx = vx_start
+vy = 0.0
+
+yaw = 0.0
+w = 0.0            # velocidade angular em Z (yaw rate)
+
+delta = 0.0
+
+# acelerações usadas para transferência de carga no passo seguinte
+ax_for_load = 0.0
+ay_for_load = 0.0
+
+vx_target = vx_start
+ay_prev = 0.0
+
+# variáveis auxiliares para critérios
+beta_prev = 0.0
+beta_dot_f = 0.0
+beta_growth_timer = 0.0
+
+R_ratio_f = 1.0
+R_open_timer = 0.0
+
+R_est_path_prev = R0
+
+
+# =========================================================
+# 9) ARRAYS DE LOGGING
+# =========================================================
+tt = []
+traj_x, traj_y = [], []
+
+vx_list, vy_list = [], []
+ax_list, ay_list = [], []
+
+yaw_list, w_list = [], []
+omega_z_list = []   
+
+delta_list = []
+beta_list = []
+
+R_est_yaw_list, R_est_path_list = [], []
+R_ratio_list = []
+R_ratio_f_list = []
+
+vx_tgt_list = []
+
+beta_dot_f_list = []
+beta_dot_f_rad_list = []
+
+ay_dot_list = []
+alpha_peak_list = []
+
+FyFL_list, FyFR_list = [], []
+FyRL_list, FyRR_list = [], []
+FyF_total_list, FyR_total_list = [], []
+Fy_total_list = []
+
+FzFL_list, FzFR_list = [], []
+FzRL_list, FzRR_list = [], []
+
+alphaFL_list, alphaFR_list = [], []
+alphaRL_list, alphaRR_list = [], []
+
+unstable = False
+unstable_info = {}
+
+
+# =========================================================
+# 10) LOOP PRINCIPAL DA SIMULAÇÃO
+# =========================================================
+for i in range(len(t)):
+    ti = t[i]
+
+    # -----------------------------------------------------
+    # 10.1) Velocidade total instantânea
+    # -----------------------------------------------------
+    V = max(np.hypot(vx, vy), 0.1)
+
+    # -----------------------------------------------------
+    # 10.2) Perfil de velocidade (delta constante, V crescente)
+    # -----------------------------------------------------
+    if ti > t_settle and vx_target < vx_max:
+        R_for_ctrl = R_est_path_prev if np.isfinite(R_est_path_prev) else R0
+        R_for_ctrl = max(R_for_ctrl, 1.0)
+
+        dvdt_ay = ay_dot_target * R_for_ctrl / (2.0 * max(V, 1.0))
+        dvdt = min(dvdt_cap, dvdt_ay)
+        vx_target = min(vx_max, vx_target + dvdt * dt)
+
+    # -----------------------------------------------------
+    # 10.3) Controlo longitudinal para seguir vx_target
+    # -----------------------------------------------------
+    erro_vx = vx_target - vx
+    ax_cmd = float(np.clip(Kp_vx * erro_vx, -ax_lim_neg, ax_lim_pos))
+    Fx_drive = m * ax_cmd
+
+    # -----------------------------------------------------
+    # 10.4) Actuador de direcção
+    # -----------------------------------------------------
+    delta_ref = float(np.clip(delta_const, -delta_max_rad, delta_max_rad))
+    delta_dot = (delta_ref - delta) / tau_steer
+
+    if use_delta_rate_limit:
+        delta_dot = float(np.clip(delta_dot, -delta_rate_max, delta_rate_max))
+
+    delta += delta_dot * dt
+    delta = float(np.clip(delta, -delta_max_rad, delta_max_rad))
+
+    # -----------------------------------------------------
+    # 10.5) Ackermann correcto nas rodas da frente
+    # -----------------------------------------------------
+    if abs(delta) > 1e-9:
+        R_abs = abs(L / np.tan(delta))
+        R_abs = max(R_abs, d_frente / 2.0 + 1e-6)
+
+        if delta > 0.0:   # curva à esquerda
+            delta_FL = np.arctan(L / (R_abs - d_frente / 2.0))
+            delta_FR = np.arctan(L / (R_abs + d_frente / 2.0))
+        else:             # curva à direita
+            delta_FL = -np.arctan(L / (R_abs + d_frente / 2.0))
+            delta_FR = -np.arctan(L / (R_abs - d_frente / 2.0))
+    else:
+        delta_FL = 0.0
+        delta_FR = 0.0
+
+    # -----------------------------------------------------
+    # 10.6) Cálculo dos slip angles
+    # -----------------------------------------------------
+    u_FL = vx - w * d_frente / 2.0
+    u_FR = vx + w * d_frente / 2.0
+    u_RL = vx - w * d_tras / 2.0
+    u_RR = vx + w * d_tras / 2.0
+
+    v_F = vy + a * w
+    v_R = vy - b * w
+
+    alpha_FL = delta_FL - np.arctan2(v_F, u_FL)
+    alpha_FR = delta_FR - np.arctan2(v_F, u_FR)
+    alpha_RL = -np.arctan2(v_R, u_RL)
+    alpha_RR = -np.arctan2(v_R, u_RR)
+
+    alpha_peak = max(abs(alpha_FL), abs(alpha_FR), abs(alpha_RL), abs(alpha_RR))
+
+    # -----------------------------------------------------
+    # 10.7) Cargas verticais com transferência quase-estática
+    # -----------------------------------------------------
+    Fz_FL_static = (b / L) * m * g / 2.0
+    Fz_FR_static = (b / L) * m * g / 2.0
+    Fz_RL_static = (a / L) * m * g / 2.0
+    Fz_RR_static = (a / L) * m * g / 2.0
+
+    deltaFz_long = (h_CG / L) * m * ax_for_load
+    deltaFz_lat_front = frac_f * (m * ay_for_load * h_CG) / d_frente
+    deltaFz_lat_rear = frac_r * (m * ay_for_load * h_CG) / d_tras
+
+    Fz_FL = Fz_FL_static - deltaFz_long / 2.0 - deltaFz_lat_front / 2.0
+    Fz_FR = Fz_FR_static - deltaFz_long / 2.0 + deltaFz_lat_front / 2.0
+    Fz_RL = Fz_RL_static + deltaFz_long / 2.0 - deltaFz_lat_rear / 2.0
+    Fz_RR = Fz_RR_static + deltaFz_long / 2.0 + deltaFz_lat_rear / 2.0
+
+    Fz_FL = max(Fz_FL, 0.0)
+    Fz_FR = max(Fz_FR, 0.0)
+    Fz_RL = max(Fz_RL, 0.0)
+    Fz_RR = max(Fz_RR, 0.0)
+
+    # -----------------------------------------------------
+    # 10.8) Forças laterais dos pneus
+    # -----------------------------------------------------
+    FyFL_t = pacejka_lateral(alpha_FL, Fz_FL, mu, C_pacejka, E_pacejka, C_alpha_front)
+    FyFR_t = pacejka_lateral(alpha_FR, Fz_FR, mu, C_pacejka, E_pacejka, C_alpha_front)
+    FyRL_t = pacejka_lateral(alpha_RL, Fz_RL, mu, C_pacejka, E_pacejka, C_alpha_rear)
+    FyRR_t = pacejka_lateral(alpha_RR, Fz_RR, mu, C_pacejka, E_pacejka, C_alpha_rear)
+
+    # projecção das rodas da frente no referencial do chassis
+    FxFL = -FyFL_t * np.sin(delta_FL)
+    FyFL = FyFL_t * np.cos(delta_FL)
+
+    FxFR = -FyFR_t * np.sin(delta_FR)
+    FyFR = FyFR_t * np.cos(delta_FR)
+
+    # atrás, sem esterçamento
+    FxRL = 0.0
+    FxRR = 0.0
+    FyRL = FyRL_t
+    FyRR = FyRR_t
+
+    # -----------------------------------------------------
+    # 10.9) Dinâmica longitudinal, lateral e de yaw
+    # -----------------------------------------------------
+    Fx_total = Fx_drive + FxFL + FxFR + FxRL + FxRR
+    Fy_total = FyFL + FyFR + FyRL + FyRR
+
+    ax_body = Fx_total / m
+    ay_body = Fy_total / m
+
+    dot_vx = ax_body + vy * w
+    dot_vy = ay_body - vx * w
+
+    Mz = (
+        a * (FyFL + FyFR)
+        - b * (FyRL + FyRR)
+        - (d_frente / 2.0) * FxFL
+        + (d_frente / 2.0) * FxFR
+    )
+
+    dot_w = Mz / Iz
+
+    vx += dot_vx * dt
+    vy += dot_vy * dt
+    w += dot_w * dt
+    yaw = wrap_pi(yaw + w * dt)
+
+    # actualizar acelerações para o próximo passo
+    ax_for_load = ax_body
+    ay_for_load = ay_body
+
+    # -----------------------------------------------------
+    # 10.10) Evolução da posição global
+    # -----------------------------------------------------
+    x += (vx * np.cos(yaw) - vy * np.sin(yaw)) * dt
+    y += (vx * np.sin(yaw) + vy * np.cos(yaw)) * dt
+
+    # -----------------------------------------------------
+    # 10.11) Métricas auxiliares
+    # -----------------------------------------------------
+    V = max(np.hypot(vx, vy), 0.1)
+    beta = np.arctan2(vy, max(vx, 1e-6))
+
+    ay_dot = (ay_body - ay_prev) / dt
+    ay_prev = ay_body
+
+    beta_dot = wrap_pi(beta - beta_prev) / dt
+    beta_prev = beta
+    beta_dot_f += (beta_dot - beta_dot_f) * (dt / tau_beta_dot)
+
+    # rotação do vector velocidade / heading da trajectória
+    chi_dot = w + beta_dot_f
+
+    if abs(w) > 1e-4:
+        R_est_yaw = V / abs(w)
+    else:
+        R_est_yaw = np.inf
+
+    if abs(chi_dot) > 1e-4:
+        R_est_path = V / abs(chi_dot)
+    else:
+        R_est_path = np.inf
+
+    if np.isfinite(R_est_path):
+        R_est_path_prev = R_est_path
+
+    R_ratio = R_est_path / max(R0, 1e-6)
+
+    if np.isfinite(R_ratio):
+        R_ratio_f += (R_ratio - R_ratio_f) * (dt / tau_R_ratio)
+
+    # -----------------------------------------------------
+    # 10.12) Logging
+    # -----------------------------------------------------
+    tt.append(ti)
+
+    traj_x.append(x)
+    traj_y.append(y)
+
+    vx_list.append(vx)
+    vy_list.append(vy)
+
+    ax_list.append(ax_body)
+    ay_list.append(ay_body)
+
+    yaw_list.append(yaw)
+    w_list.append(w)
+    omega_z_list.append(w)
+
+    delta_list.append(np.rad2deg(delta))
+    beta_list.append(np.rad2deg(beta))
+
+    R_est_yaw_list.append(R_est_yaw)
+    R_est_path_list.append(R_est_path)
+    R_ratio_list.append(R_ratio)
+    R_ratio_f_list.append(R_ratio_f)
+
+    vx_tgt_list.append(vx_target)
+
+    beta_dot_f_list.append(np.rad2deg(beta_dot_f))
+    beta_dot_f_rad_list.append(beta_dot_f)
+
+    ay_dot_list.append(ay_dot)
+    alpha_peak_list.append(np.rad2deg(alpha_peak))
+
+    FyFL_list.append(FyFL)
+    FyFR_list.append(FyFR)
+    FyRL_list.append(FyRL)
+    FyRR_list.append(FyRR)
+
+    FyF_total_list.append(FyFL + FyFR)
+    FyR_total_list.append(FyRL + FyRR)
+    Fy_total_list.append(Fy_total)
+
+    FzFL_list.append(Fz_FL)
+    FzFR_list.append(Fz_FR)
+    FzRL_list.append(Fz_RL)
+    FzRR_list.append(Fz_RR)
+
+    alphaFL_list.append(np.rad2deg(alpha_FL))
+    alphaFR_list.append(np.rad2deg(alpha_FR))
+    alphaRL_list.append(np.rad2deg(alpha_RL))
+    alphaRR_list.append(np.rad2deg(alpha_RR))
+
+    # debug periódico
+    if i % int(0.5 / dt) == 0:
+        print(
+            f"t={ti:6.1f}s | vx={vx:6.2f} (tgt={vx_target:6.2f}) | "
+            f"delta={np.rad2deg(delta):+6.2f}° | ay={ay_body:+6.2f} | "
+            f"w={w:+6.3f} | beta={np.rad2deg(beta):+7.2f}° | "
+            f"beta_dot_f={np.rad2deg(beta_dot_f):+7.2f}°/s | "
+            f"R_ratio_f={R_ratio_f:5.2f}"
+        )
+
+    # -----------------------------------------------------
+    # 10.13) Guardas numéricas
+    # -----------------------------------------------------
+    if nan_guard:
+        if (
+            (not np.isfinite(x)) or (not np.isfinite(y)) or
+            (not np.isfinite(vx)) or (not np.isfinite(vy)) or
+            (not np.isfinite(w)) or
+            (not np.isfinite(ax_body)) or (not np.isfinite(ay_body))
+        ):
+            unstable = True
+            unstable_info = {
+                "t": ti,
+                "vx": vx,
+                "ay": ay_body,
+                "w": w,
+                "beta_deg": np.rad2deg(beta),
+                "reason": "NaN/Inf"
+            }
+            break
+
+    if vx < vx_min_guard:
+        unstable = True
+        unstable_info = {
+            "t": ti,
+            "vx": vx,
+            "ay": ay_body,
+            "w": w,
+            "beta_deg": np.rad2deg(beta),
+            "reason": "vx_too_low"
+        }
+        break
+
+    if alpha_peak > alpha_guard:
+        unstable = True
+        unstable_info = {
+            "t": ti,
+            "vx": vx,
+            "ay": ay_body,
+            "w": w,
+            "beta_deg": np.rad2deg(beta),
+            "alpha_peak_deg": np.rad2deg(alpha_peak),
+            "reason": "excessive_slip_angle"
+        }
+        break
+
+    # -----------------------------------------------------
+    # 10.14) Critérios de fim do ensaio
+    # -----------------------------------------------------
+    can_eval = (ti > t_criteria_start) and (V > V_min_for_criteria)
+
+    beta_growth = False
+    if use_beta_growth_criterion and can_eval:
+        if (abs(beta) > beta_abs_min) and (abs(beta_dot_f) > beta_dot_lim):
+            beta_growth_timer += dt
+        else:
+            beta_growth_timer = max(0.0, beta_growth_timer - 2.0 * dt)
+
+        beta_growth = (beta_growth_timer >= hold_time_beta)
+
+    radius_open = False
+    if (
+        use_radius_open_criterion and
+        can_eval and
+        (abs(chi_dot) > chi_dot_min_for_R) and
+        np.isfinite(R_ratio_f)
+    ):
+        if R_ratio_f > R_ratio_lim:
+            R_open_timer += dt
+        else:
+            R_open_timer = max(0.0, R_open_timer - 2.0 * dt)
+
+        radius_open = (R_open_timer >= hold_time_R)
+
+    if radius_open:
+        unstable = True
+        unstable_info = {
+            "t": ti,
+            "vx": vx,
+            "ay": ay_body,
+            "w": w,
+            "beta_deg": np.rad2deg(beta),
+            "R_est_path": R_est_path,
+            "R_ratio_f": R_ratio_f,
+            "reason": "R_path/R0_open (understeer-limit)"
+        }
+        break
+
+    if beta_growth:
+        unstable = True
+        unstable_info = {
+            "t": ti,
+            "vx": vx,
+            "ay": ay_body,
+            "w": w,
+            "beta_deg": np.rad2deg(beta),
+            "beta_dot_deg_s": np.rad2deg(beta_dot_f),
+            "reason": "beta_growth_rate"
+        }
+        break
+
+
+# =========================================================
+# 11) CONVERSÃO DOS LOGS PARA NUMPY
+# =========================================================
+tt = np.asarray(tt)
+
+traj_x = np.asarray(traj_x)
+traj_y = np.asarray(traj_y)
+
+vx_list = np.asarray(vx_list)
+vy_list = np.asarray(vy_list)
+
+ax_list = np.asarray(ax_list)
+ay_list = np.asarray(ay_list)
+
+yaw_list = np.asarray(yaw_list)
+w_list = np.asarray(w_list)
+omega_z_list = np.asarray(omega_z_list)
+
+delta_list = np.asarray(delta_list)
+beta_list = np.asarray(beta_list)
+
+R_est_yaw_list = np.asarray(R_est_yaw_list)
+R_est_path_list = np.asarray(R_est_path_list)
+R_ratio_list = np.asarray(R_ratio_list)
+R_ratio_f_list = np.asarray(R_ratio_f_list)
+
+vx_tgt_list = np.asarray(vx_tgt_list)
+
+beta_dot_f_list = np.asarray(beta_dot_f_list)
+beta_dot_f_rad_list = np.asarray(beta_dot_f_rad_list)
+
+ay_dot_list = np.asarray(ay_dot_list)
+alpha_peak_list = np.asarray(alpha_peak_list)
+
+FyFL_list = np.asarray(FyFL_list)
+FyFR_list = np.asarray(FyFR_list)
+FyRL_list = np.asarray(FyRL_list)
+FyRR_list = np.asarray(FyRR_list)
+
+FyF_total_list = np.asarray(FyF_total_list)
+FyR_total_list = np.asarray(FyR_total_list)
+Fy_total_list = np.asarray(Fy_total_list)
+
+FzFL_list = np.asarray(FzFL_list)
+FzFR_list = np.asarray(FzFR_list)
+FzRL_list = np.asarray(FzRL_list)
+FzRR_list = np.asarray(FzRR_list)
+
+alphaFL_list = np.asarray(alphaFL_list)
+alphaFR_list = np.asarray(alphaFR_list)
+alphaRL_list = np.asarray(alphaRL_list)
+alphaRR_list = np.asarray(alphaRR_list)
+
+
+# =========================================================
+# 11.1) EXPORTAÇÃO DOS DADOS PARA CSV (amostrado a cada 10 ms)
+# =========================================================
+export_dt = 0.010  # 10 ms
+export_stride = max(1, int(round(export_dt / dt)))
+
+idx = np.arange(0, len(tt), export_stride)
+
+df = pd.DataFrame({
+    "t_s": tt[idx],
+
+    # trajectória
+    "traj_x_m": traj_x[idx],
+    "traj_y_m": traj_y[idx],
+
+    # velocidades
+    "vx_mps": vx_list[idx],
+    "vy_mps": vy_list[idx],
+    "vx_target_mps": vx_tgt_list[idx],
+
+    # acelerações
+    "ax_mps2": ax_list[idx],
+    "ay_mps2": ay_list[idx],
+    "ay_dot_mps3": ay_dot_list[idx],
+
+    # atitude / rotação
+    "yaw_rad": yaw_list[idx],
+    "yaw_deg": np.rad2deg(yaw_list[idx]),
+    "w_radps": w_list[idx],
+    "omega_z_radps": omega_z_list[idx],
+
+    # direcção / sideslip
+    "delta_deg": delta_list[idx],
+    "beta_deg": beta_list[idx],
+    "beta_dot_f_degps": beta_dot_f_list[idx],
+    "beta_dot_f_radps": beta_dot_f_rad_list[idx],
+
+    # raios
+    "R_est_yaw_m": R_est_yaw_list[idx],
+    "R_est_path_m": R_est_path_list[idx],
+    "R_ratio": R_ratio_list[idx],
+    "R_ratio_f": R_ratio_f_list[idx],
+
+    # forças laterais
+    "FyFL_N": FyFL_list[idx],
+    "FyFR_N": FyFR_list[idx],
+    "FyRL_N": FyRL_list[idx],
+    "FyRR_N": FyRR_list[idx],
+    "FyF_total_N": FyF_total_list[idx],
+    "FyR_total_N": FyR_total_list[idx],
+    "Fy_total_N": Fy_total_list[idx],
+
+    # cargas verticais
+    "FzFL_N": FzFL_list[idx],
+    "FzFR_N": FzFR_list[idx],
+    "FzRL_N": FzRL_list[idx],
+    "FzRR_N": FzRR_list[idx],
+
+    # slip angles
+    "alphaFL_deg": alphaFL_list[idx],
+    "alphaFR_deg": alphaFR_list[idx],
+    "alphaRL_deg": alphaRL_list[idx],
+    "alphaRR_deg": alphaRR_list[idx],
+    "alpha_peak_deg": alpha_peak_list[idx],
+})
+
+csv_filename = "iso4138_metodo2_dados_10ms.csv"
+df.to_csv(csv_filename, index=False, sep=";")
+
+print(f"CSV exportado com sucesso: {csv_filename}")
+print(f"Passo de exportação: {export_dt:.3f} s")
+print(f"Número de linhas exportadas: {len(df)}")
+
+
+# =========================================================
+# 12) RESUMO FINAL DO ENSAIO
+# =========================================================
+print("\n================ ISO 4138 — MÉTODO 2 ================")
+print(f"delta_const (roda): {np.rad2deg(delta_const):+.3f} ° | R0: {R0:.1f} m")
+print(f"ay_dot_target: {ay_dot_target:.3f} m/s²/s (cap dv/dt={dvdt_cap:.2f})")
+print(f"Critérios activos: beta_growth={use_beta_growth_criterion} | R_open={use_radius_open_criterion}")
+
+if unstable:
+    print(">>> LIMITE detectado")
+
+    msg = (
+        f"t={unstable_info['t']:.3f}s | "
+        f"vx={unstable_info['vx']:.3f} m/s | "
+        f"ay={unstable_info['ay']:.3f} m/s² | "
+        f"w={unstable_info['w']:.3f} rad/s | "
+        f"beta={unstable_info['beta_deg']:.2f}° | "
+        f"reason={unstable_info['reason']}"
+    )
+
+    if "R_ratio_f" in unstable_info:
+        msg += (
+            f" | R_path={unstable_info['R_est_path']:.2f} m"
+            f" | R_ratio_f={unstable_info['R_ratio_f']:.2f}"
+        )
+
+    if "beta_dot_deg_s" in unstable_info:
+        msg += f" | beta_dot_f={unstable_info['beta_dot_deg_s']:.2f}°/s"
+
+    if "alpha_peak_deg" in unstable_info:
+        msg += f" | alpha_peak={unstable_info['alpha_peak_deg']:.2f}°"
+
+    print(msg)
+else:
+    print(">>> Não atingiu limite dentro do tempo/velocidade máxima.")
+
+print("=====================================================\n")
+
+
+# =========================================================
+# 13) GRÁFICOS
+# =========================================================
+
+# ---------------------------------------------------------
+# Gráfico 1 — Trajectória no plano X-Y
+# ---------------------------------------------------------
+plt.figure(figsize=(9, 8))
+plt.plot(traj_x, traj_y, lw=2)
+plt.axis('equal')
+plt.grid(True)
+plt.title('Trajectória (Método 2 — δ constante, V crescente)')
+plt.xlabel('X [m]')
+plt.ylabel('Y [m]')
+plt.tight_layout()
+plt.show()
+
+
+# ---------------------------------------------------------
+# Gráfico 2 — Velocidade longitudinal
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 5))
+plt.plot(tt, vx_list, label='vx')
+plt.grid(True)
+plt.title('Velocidade longitudinal ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('Velocidade [m/s]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ---------------------------------------------------------
+# Gráfico 3 — Aceleração lateral
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 5))
+plt.plot(tt, ay_list, label='ay')
+plt.grid(True)
+plt.title('Aceleração lateral ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('Aceleração lateral [m/s²]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------
+# Gráfico 3.5 — Aceleração longitudinal
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 5))
+plt.plot(tt, ax_list, label='ax')
+plt.grid(True)
+plt.title('Aceleração longitudinal ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('Aceleração longitudinal [m/s²]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------
+# Gráfico 4 — Sideslip beta
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 5))
+plt.plot(tt, beta_list, label='beta')
+plt.grid(True)
+plt.title('Sideslip β ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('β [deg]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ---------------------------------------------------------
+# Gráfico 5 — Velocidade angular em Z
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 5))
+plt.plot(tt, omega_z_list, label='ωz = w', lw=2)
+plt.grid(True)
+plt.title('Velocidade angular em Z ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('ωz [rad/s]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ---------------------------------------------------------
+# Gráfico 6 — Forças laterais em cada roda
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 6))
+plt.plot(tt, FyFL_list, label='FyFL')
+plt.plot(tt, FyFR_list, label='FyFR')
+plt.plot(tt, FyRL_list, label='FyRL')
+plt.plot(tt, FyRR_list, label='FyRR')
+plt.grid(True)
+plt.title('Forças laterais em cada roda ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('Força lateral [N]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ---------------------------------------------------------
+# Gráfico 7 — Slip angles individuais
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 6))
+plt.plot(tt, alphaFL_list, label='alpha_FL')
+plt.plot(tt, alphaFR_list, label='alpha_FR')
+plt.plot(tt, alphaRL_list, label='alpha_RL')
+plt.plot(tt, alphaRR_list, label='alpha_RR')
+plt.grid(True)
+plt.title('Slip angles individuais ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('Slip angle [deg]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ---------------------------------------------------------
+# Gráfico 8 — Raio instantâneo da trajectória
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 5))
+plt.plot(tt, R_est_path_list, label='Raio actual (R_path)', lw=2)
+plt.axhline(R0, color='r', linestyle='--', label=f'Raio suposto = {R0:.1f} m')
+plt.grid(True)
+plt.title('Raio actual ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('Raio [m]')
+plt.ylim(0, 15)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ---------------------------------------------------------
+# Gráfico 9 — Cargas verticais em cada roda
+# ---------------------------------------------------------
+plt.figure(figsize=(12, 6))
+plt.plot(tt, FzFL_list, label='Fz_FL')
+plt.plot(tt, FzFR_list, label='Fz_FR')
+plt.plot(tt, FzRL_list, label='Fz_RL')
+plt.plot(tt, FzRR_list, label='Fz_RR')
+plt.grid(True)
+plt.title('Cargas verticais em cada roda ao longo do tempo')
+plt.xlabel('Tempo [s]')
+plt.ylabel('Carga vertical [N]')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# =========================================================
+# 14) ANIMAÇÃO 2D DA MANOBRA
+# =========================================================
+fig, axp = plt.subplots(figsize=(9, 9))
+axp.set_aspect('equal')
+axp.grid(True)
+axp.set_title('Animação 2D — Método 2 (δ constante, V crescente)')
+axp.plot(traj_x, traj_y, lw=1.5, alpha=0.7, label='traj')
+axp.legend()
+
+pad = 10.0
+axp.set_xlim(float(np.min(traj_x) - pad), float(np.max(traj_x) + pad))
+axp.set_ylim(float(np.min(traj_y) - pad), float(np.max(traj_y) + pad))
+
+car_length = 2.0
+car_width = 1.0
+
+car_patch = patches.Rectangle(
+    (-car_length / 2, -car_width / 2),
+    car_length,
+    car_width,
+    linewidth=1.2,
+    edgecolor='black',
+    facecolor='blue',
+    alpha=0.85
+)
+axp.add_patch(car_patch)
+
+nose_line, = axp.plot([], [], lw=2)
+
+
+def update(frame):
+    """
+    Actualiza a posição e orientação do veículo na animação.
+    """
+    xx = float(traj_x[frame])
+    yy = float(traj_y[frame])
+    ang = float(yaw_list[frame])
+
+    trans = Affine2D().rotate(ang).translate(xx, yy) + axp.transData
+    car_patch.set_transform(trans)
+
+    nx = xx + 1.2 * np.cos(ang)
+    ny = yy + 1.2 * np.sin(ang)
+    nose_line.set_data([xx, nx], [yy, ny])
+
+    return car_patch, nose_line
+
+
+stride = 20
+frames = range(0, len(traj_x), stride)
+
+ani = animation.FuncAnimation(
+    fig,
+    update,
+    frames=frames,
+    interval=5,
+    blit=True
+)
+
+plt.show()
