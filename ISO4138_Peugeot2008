@@ -15,17 +15,17 @@ from matplotlib.transforms import Affine2D
 # =========================================================
 # 1) FUNÇÕES AUXILIARES
 # =========================================================
-def pacejka_lateral(alpha, Fz, mu, C, E, C_alpha):
+def pacejka_lateral(alpha, Fz, u, C, E, C_alpha):
     """
     Modelo lateral tipo Pacejka simplificado.
     Recebe:
         alpha   -> slip angle [rad]
         Fz      -> carga vertical [N]
-        mu, C, E, C_alpha -> parâmetros do pneu
+        u, C, E, C_alpha -> parâmetros do pneu
     Devolve:
         força lateral Fy [N]
     """
-    D = mu * Fz
+    D = u * Fz
     if D < 1e-6:
         return 0.0
 
@@ -76,7 +76,7 @@ Iz = m * a * b + 0.25 * m_f * d_frente**2 + 0.25 * m_r * d_tras**2
 C_alpha_front = 100000.0
 C_alpha_rear = 100000.0
 
-mu = 1.1
+u = 1.1
 C_pacejka = 1.8
 E_pacejka = 0.1
 
@@ -328,10 +328,10 @@ for i in range(len(t)):
     # -----------------------------------------------------
     # 10.8) Forças laterais dos pneus
     # -----------------------------------------------------
-    FyFL_t = pacejka_lateral(alpha_FL, Fz_FL, mu, C_pacejka, E_pacejka, C_alpha_front)
-    FyFR_t = pacejka_lateral(alpha_FR, Fz_FR, mu, C_pacejka, E_pacejka, C_alpha_front)
-    FyRL_t = pacejka_lateral(alpha_RL, Fz_RL, mu, C_pacejka, E_pacejka, C_alpha_rear)
-    FyRR_t = pacejka_lateral(alpha_RR, Fz_RR, mu, C_pacejka, E_pacejka, C_alpha_rear)
+    FyFL_t = pacejka_lateral(alpha_FL, Fz_FL, u, C_pacejka, E_pacejka, C_alpha_front)
+    FyFR_t = pacejka_lateral(alpha_FR, Fz_FR, u, C_pacejka, E_pacejka, C_alpha_front)
+    FyRL_t = pacejka_lateral(alpha_RL, Fz_RL, u, C_pacejka, E_pacejka, C_alpha_rear)
+    FyRR_t = pacejka_lateral(alpha_RR, Fz_RR, u, C_pacejka, E_pacejka, C_alpha_rear)
 
     # projecção das rodas da frente no referencial do chassis
     FxFL = -FyFL_t * np.sin(delta_FL)
