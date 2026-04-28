@@ -1,0 +1,1077 @@
+# -*- coding: utf-8 -*-
+"""
+Monte Carlo ISO 4138 — Método 2
+Variação uniforme de +/- 5% nas propriedades do veículo e pneus.
+
+Correcção importante:
+    Em vez de variar 'a' e 'b' independentemente, varia-se:
+        - L
+        - cg_frac_front = a / L
+
+    Depois:
+        a = cg_frac_front * L
+        b = (1.0 - cg_frac_front) * L
+
+Isto separa melhor:
+    - efeito da distância entre eixos
+    - efeito da posição longitudinal relativa do C.G.
+
+Inclui:
+    - massa
+    - distância entre eixos
+    - posição longitudinal relativa do C.G.
+    - vias dianteira/traseira
+    - altura do C.G.
+    - momento de inércia em yaw via Iz_scale
+    - parâmetros dos pneus
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =========================================================
+# 1) FUNÇÕES AUXILIARES
+# =========================================================
+
+def pacejka_lateral(alpha, Fz, u, C, E, C_alpha):
+    """
+    Modelo lateral tipo Pacejka simplificado.
+    """
+    D = u * Fz
+
+    if D < 1e-6:
+        return 0.0
+
+    B = C_alpha / (C * D)
+
+    return D * np.sin(
+        C * np.arctan(
+            B * alpha - E * (B * alpha - np.arctan(B * alpha))
+        )
+    )
+
+
+def wrap_pi(angle):
+    """
+    Coloca um ângulo no intervalo [-pi, pi].
+    """
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def spearman_corr(x, y):
+    """
+    Correlação de Spearman simples sem scipy.
+    """
+    x_rank = pd.Series(x).rank().to_numpy()
+    y_rank = pd.Series(y).rank().to_numpy()
+
+    return np.corrcoef(x_rank, y_rank)[0, 1]
+
+
+# =========================================================
+# 2) PARÂMETROS BASE
+# =========================================================
+
+# Valores originais do veículo eléctrico:
+# a = 1.181
+# b = 1.439
+# L = 2.620
+#
+# cg_frac_front = a / L
+# cg_frac_rear  = b / L
+
+a_base = 1.033
+b_base = 1.587
+L_base = a_base + b_base
+cg_frac_front_base = a_base / L_base
+
+base_params = {
+    # Veículo
+    "m": 1316.0,
+
+    # Nova parametrização longitudinal
+    "L": L_base,
+    "cg_frac_front": cg_frac_front_base,
+
+    "d_frente": 1.54,
+    "d_tras": 1.54,
+    "h_CG": 0.483,
+
+    # Factor adicional sobre o momento de inércia calculado
+    # Iz = Iz_base * Iz_scale
+    "Iz_scale": 1.0,
+
+    # Pneus
+    "C_alpha_front": 100000.0,
+    "C_alpha_rear": 100000.0,
+    "u": 1.1,
+    "C_pacejka": 1.8,
+    "E_pacejka": 0.1,
+}
+
+
+# Parâmetros que vão oscilar +/-5%.
+#
+# Atenção:
+#   'a' e 'b' já não são perturbados directamente.
+#   São calculados a partir de L e cg_frac_front.
+mc_param_names = [
+    "m",
+    "L",
+    "cg_frac_front",
+    "d_frente",
+    "d_tras",
+    "h_CG",
+    "Iz_scale",
+    "C_alpha_front",
+    "C_alpha_rear",
+    "u",
+    "C_pacejka",
+    "E_pacejka",
+]
+
+
+# =========================================================
+# 3) SIMULAÇÃO
+# =========================================================
+
+def run_simulation(params, dt=0.001, t_total=200.0, debug=False):
+    """
+    Corre uma simulação ISO 4138 Método 2 com os parâmetros fornecidos.
+
+    Devolve métricas resumidas para Monte Carlo.
+    """
+
+    # -----------------------------------------------------
+    # Parâmetros do veículo
+    # -----------------------------------------------------
+    m = params["m"]
+
+    L = params["L"]
+    cg_frac_front = params["cg_frac_front"]
+
+    # Guardas para evitar geometrias absurdas se aumentares a variação
+    cg_frac_front = float(np.clip(cg_frac_front, 0.25, 0.75))
+
+    a = cg_frac_front * L
+    b = (1.0 - cg_frac_front) * L
+
+    d_frente = params["d_frente"]
+    d_tras = params["d_tras"]
+    h_CG = params["h_CG"]
+    Iz_scale = params["Iz_scale"]
+
+    g = 9.81
+
+    m_f = m * b / L
+    m_r = m * a / L
+
+    Iz_base = (
+        m * a * b
+        + 0.25 * m_f * d_frente**2
+        + 0.25 * m_r * d_tras**2
+    )
+
+    Iz = Iz_base * Iz_scale
+
+    # -----------------------------------------------------
+    # Parâmetros dos pneus
+    # -----------------------------------------------------
+    C_alpha_front = params["C_alpha_front"]
+    C_alpha_rear = params["C_alpha_rear"]
+    u = params["u"]
+    C_pacejka = params["C_pacejka"]
+    E_pacejka = params["E_pacejka"]
+
+    # -----------------------------------------------------
+    # Inputs do ensaio ISO 4138 — Método 2
+    # -----------------------------------------------------
+    delta_max_rad = np.deg2rad(25.0)
+    tau_steer = 0.03
+
+    use_delta_rate_limit = True
+    delta_rate_max = np.deg2rad(600.0)
+
+    R = 7.5
+
+    # Como L agora é variável, delta_const também varia.
+    # Isto é correcto se o ensaio mantiver o mesmo raio-alvo.
+    delta_const = np.arctan(L / R)
+
+    turn_direction = +1.0
+    delta_const *= turn_direction
+
+    vx_start = 3.0
+    vx_max = 40.0
+
+    ay_dot_target = 0.24
+    dvdt_cap = 1.80
+    t_settle = 0.5
+
+    # Controlo longitudinal
+    Kp_vx = 3.6
+    ax_lim_pos = 6.0
+    ax_lim_neg = 7.0
+
+    # -----------------------------------------------------
+    # Critérios de fim do ensaio
+    # -----------------------------------------------------
+    use_beta_growth_criterion = True
+    beta_abs_min = np.deg2rad(8.0)
+    beta_dot_lim = np.deg2rad(12.0)
+    tau_beta_dot = 0.25
+    hold_time_beta = 0.20
+
+    use_radius_open_criterion = True
+    R_ratio_lim = 1.25
+    tau_R_ratio = 0.50
+    hold_time_R = 0.50
+    chi_dot_min_for_R = 0.05
+    V_min_for_criteria = 5.0
+    t_criteria_start = t_settle + 2.0
+
+    # Guardas numéricas
+    nan_guard = True
+    vx_min_guard = 0.2
+    alpha_guard = np.deg2rad(45.0)
+
+    # -----------------------------------------------------
+    # Distribuição estática de carga
+    # -----------------------------------------------------
+    Wf = (b / L) * m * g
+    Wr = (a / L) * m * g
+
+    frac_f = Wf / (Wf + Wr)
+    frac_r = Wr / (Wf + Wr)
+
+    # -----------------------------------------------------
+    # Estados iniciais
+    # -----------------------------------------------------
+    x = 0.0
+    y = 0.0
+
+    vx = vx_start
+    vy = 0.0
+
+    yaw = 0.0
+    w = 0.0
+
+    delta = 0.0
+
+    ax_for_load = 0.0
+    ay_for_load = 0.0
+
+    vx_target = vx_start
+    ay_prev = 0.0
+
+    beta_prev = 0.0
+    beta_dot_f = 0.0
+    beta_growth_timer = 0.0
+
+    R_ratio_f = 1.0
+    R_open_timer = 0.0
+
+    R_est_path_prev = R
+
+    unstable = False
+
+    unstable_info = {
+        "reason": "completed",
+        "t": t_total,
+        "vx": vx,
+        "ay": 0.0,
+        "w": 0.0,
+        "beta_deg": 0.0,
+        "R_ratio_f": 1.0,
+    }
+
+    # -----------------------------------------------------
+    # Métricas principais
+    # -----------------------------------------------------
+    ay_max_abs = 0.0
+    ay_max = -np.inf
+    ay_min = np.inf
+
+    ax_max_abs = 0.0
+    beta_max_abs_deg = 0.0
+    alpha_peak_max_deg = 0.0
+    w_max_abs = 0.0
+
+    t = np.arange(0.0, t_total, dt)
+
+    # =====================================================
+    # LOOP PRINCIPAL
+    # =====================================================
+    for i, ti in enumerate(t):
+
+        # -------------------------------------------------
+        # Velocidade total instantânea
+        # -------------------------------------------------
+        V = max(np.hypot(vx, vy), 0.1)
+
+        # -------------------------------------------------
+        # Perfil de velocidade
+        # -------------------------------------------------
+        if ti > t_settle and vx_target < vx_max:
+            R_for_ctrl = R_est_path_prev if np.isfinite(R_est_path_prev) else R
+            R_for_ctrl = max(R_for_ctrl, 1.0)
+
+            dvdt_ay = ay_dot_target * R_for_ctrl / (2.0 * max(V, 1.0))
+            dvdt = min(dvdt_cap, dvdt_ay)
+            vx_target = min(vx_max, vx_target + dvdt * dt)
+
+        # -------------------------------------------------
+        # Controlo longitudinal
+        # -------------------------------------------------
+        erro_vx = vx_target - vx
+        ax_cmd = float(np.clip(Kp_vx * erro_vx, -ax_lim_neg, ax_lim_pos))
+        Fx_drive = m * ax_cmd
+
+        # -------------------------------------------------
+        # Actuador de direcção
+        # -------------------------------------------------
+        delta_ref = float(np.clip(delta_const, -delta_max_rad, delta_max_rad))
+        delta_dot = (delta_ref - delta) / tau_steer
+
+        if use_delta_rate_limit:
+            delta_dot = float(np.clip(delta_dot, -delta_rate_max, delta_rate_max))
+
+        delta += delta_dot * dt
+        delta = float(np.clip(delta, -delta_max_rad, delta_max_rad))
+
+        # -------------------------------------------------
+        # Ackermann correcto nas rodas da frente
+        # -------------------------------------------------
+        if abs(delta) > 1e-9:
+            R_abs = abs(L / np.tan(delta))
+            R_abs = max(R_abs, d_frente / 2.0 + 1e-6)
+
+            if delta > 0.0:
+                delta_FL = np.arctan(L / (R_abs - d_frente / 2.0))
+                delta_FR = np.arctan(L / (R_abs + d_frente / 2.0))
+            else:
+                delta_FL = -np.arctan(L / (R_abs + d_frente / 2.0))
+                delta_FR = -np.arctan(L / (R_abs - d_frente / 2.0))
+        else:
+            delta_FL = 0.0
+            delta_FR = 0.0
+
+        # -------------------------------------------------
+        # Slip angles
+        # -------------------------------------------------
+        u_FL = vx - w * d_frente / 2.0
+        u_FR = vx + w * d_frente / 2.0
+        u_RL = vx - w * d_tras / 2.0
+        u_RR = vx + w * d_tras / 2.0
+
+        v_F = vy + a * w
+        v_R = vy - b * w
+
+        alpha_FL = delta_FL - np.arctan2(v_F, u_FL)
+        alpha_FR = delta_FR - np.arctan2(v_F, u_FR)
+        alpha_RL = -np.arctan2(v_R, u_RL)
+        alpha_RR = -np.arctan2(v_R, u_RR)
+
+        alpha_peak = max(
+            abs(alpha_FL),
+            abs(alpha_FR),
+            abs(alpha_RL),
+            abs(alpha_RR),
+        )
+
+        # -------------------------------------------------
+        # Cargas verticais com transferência quase-estática
+        # -------------------------------------------------
+        Fz_FL_static = (b / L) * m * g / 2.0
+        Fz_FR_static = (b / L) * m * g / 2.0
+        Fz_RL_static = (a / L) * m * g / 2.0
+        Fz_RR_static = (a / L) * m * g / 2.0
+
+        deltaFz_long = (h_CG / L) * m * ax_for_load
+        deltaFz_lat_front = frac_f * (m * ay_for_load * h_CG) / d_frente
+        deltaFz_lat_rear = frac_r * (m * ay_for_load * h_CG) / d_tras
+
+        Fz_FL = Fz_FL_static - deltaFz_long / 2.0 - deltaFz_lat_front / 2.0
+        Fz_FR = Fz_FR_static - deltaFz_long / 2.0 + deltaFz_lat_front / 2.0
+        Fz_RL = Fz_RL_static + deltaFz_long / 2.0 - deltaFz_lat_rear / 2.0
+        Fz_RR = Fz_RR_static + deltaFz_long / 2.0 + deltaFz_lat_rear / 2.0
+
+        Fz_FL = max(Fz_FL, 0.0)
+        Fz_FR = max(Fz_FR, 0.0)
+        Fz_RL = max(Fz_RL, 0.0)
+        Fz_RR = max(Fz_RR, 0.0)
+
+        # -------------------------------------------------
+        # Forças laterais dos pneus
+        # -------------------------------------------------
+        FyFL_t = pacejka_lateral(
+            alpha_FL,
+            Fz_FL,
+            u,
+            C_pacejka,
+            E_pacejka,
+            C_alpha_front,
+        )
+
+        FyFR_t = pacejka_lateral(
+            alpha_FR,
+            Fz_FR,
+            u,
+            C_pacejka,
+            E_pacejka,
+            C_alpha_front,
+        )
+
+        FyRL_t = pacejka_lateral(
+            alpha_RL,
+            Fz_RL,
+            u,
+            C_pacejka,
+            E_pacejka,
+            C_alpha_rear,
+        )
+
+        FyRR_t = pacejka_lateral(
+            alpha_RR,
+            Fz_RR,
+            u,
+            C_pacejka,
+            E_pacejka,
+            C_alpha_rear,
+        )
+
+        # Projecção das rodas da frente no referencial do chassis
+        FxFL = -FyFL_t * np.sin(delta_FL)
+        FyFL = FyFL_t * np.cos(delta_FL)
+
+        FxFR = -FyFR_t * np.sin(delta_FR)
+        FyFR = FyFR_t * np.cos(delta_FR)
+
+        # Atrás, sem esterçamento
+        FxRL = 0.0
+        FxRR = 0.0
+        FyRL = FyRL_t
+        FyRR = FyRR_t
+
+        # -------------------------------------------------
+        # Dinâmica longitudinal, lateral e yaw
+        # -------------------------------------------------
+        Fx_total = Fx_drive + FxFL + FxFR + FxRL + FxRR
+        Fy_total = FyFL + FyFR + FyRL + FyRR
+
+        ax_body = Fx_total / m
+        ay_body = Fy_total / m
+
+        dot_vx = ax_body + vy * w
+        dot_vy = ay_body - vx * w
+
+        Mz = (
+            a * (FyFL + FyFR)
+            - b * (FyRL + FyRR)
+            - (d_frente / 2.0) * FxFL
+            + (d_frente / 2.0) * FxFR
+        )
+
+        dot_w = Mz / Iz
+
+        vx += dot_vx * dt
+        vy += dot_vy * dt
+        w += dot_w * dt
+        yaw = wrap_pi(yaw + w * dt)
+
+        # Actualizar acelerações para transferência de carga no passo seguinte
+        ax_for_load = ax_body
+        ay_for_load = ay_body
+
+        # -------------------------------------------------
+        # Evolução da posição global
+        # -------------------------------------------------
+        x += (vx * np.cos(yaw) - vy * np.sin(yaw)) * dt
+        y += (vx * np.sin(yaw) + vy * np.cos(yaw)) * dt
+
+        # -------------------------------------------------
+        # Métricas auxiliares
+        # -------------------------------------------------
+        V = max(np.hypot(vx, vy), 0.1)
+        beta = np.arctan2(vy, max(vx, 1e-6))
+
+        ay_dot = (ay_body - ay_prev) / dt
+        ay_prev = ay_body
+
+        beta_dot = wrap_pi(beta - beta_prev) / dt
+        beta_prev = beta
+        beta_dot_f += (beta_dot - beta_dot_f) * (dt / tau_beta_dot)
+
+        chi_dot = w + beta_dot_f
+
+        if abs(w) > 1e-4:
+            R_est_yaw = V / abs(w)
+        else:
+            R_est_yaw = np.inf
+
+        if abs(chi_dot) > 1e-4:
+            R_est_path = V / abs(chi_dot)
+        else:
+            R_est_path = np.inf
+
+        if np.isfinite(R_est_path):
+            R_est_path_prev = R_est_path
+
+        R_ratio = R_est_path / max(R, 1e-6)
+
+        if np.isfinite(R_ratio):
+            R_ratio_f += (R_ratio - R_ratio_f) * (dt / tau_R_ratio)
+
+        # -------------------------------------------------
+        # Actualizar métricas de resumo
+        # -------------------------------------------------
+        ay_max_abs = max(ay_max_abs, abs(ay_body))
+        ay_max = max(ay_max, ay_body)
+        ay_min = min(ay_min, ay_body)
+
+        ax_max_abs = max(ax_max_abs, abs(ax_body))
+        beta_max_abs_deg = max(beta_max_abs_deg, abs(np.rad2deg(beta)))
+        alpha_peak_max_deg = max(alpha_peak_max_deg, abs(np.rad2deg(alpha_peak)))
+        w_max_abs = max(w_max_abs, abs(w))
+
+        if debug and i % int(0.5 / dt) == 0:
+            print(
+                f"t={ti:6.1f}s | "
+                f"vx={vx:6.2f} | "
+                f"ay={ay_body:+6.2f} | "
+                f"beta={np.rad2deg(beta):+7.2f}° | "
+                f"R_ratio_f={R_ratio_f:5.2f}"
+            )
+
+        # -------------------------------------------------
+        # Guardas numéricas
+        # -------------------------------------------------
+        if nan_guard:
+            if (
+                (not np.isfinite(x)) or
+                (not np.isfinite(y)) or
+                (not np.isfinite(vx)) or
+                (not np.isfinite(vy)) or
+                (not np.isfinite(w)) or
+                (not np.isfinite(ax_body)) or
+                (not np.isfinite(ay_body))
+            ):
+                unstable = True
+                unstable_info = {
+                    "t": ti,
+                    "vx": vx,
+                    "ay": ay_body,
+                    "w": w,
+                    "beta_deg": np.rad2deg(beta),
+                    "R_ratio_f": R_ratio_f,
+                    "reason": "NaN/Inf",
+                }
+                break
+
+        if vx < vx_min_guard:
+            unstable = True
+            unstable_info = {
+                "t": ti,
+                "vx": vx,
+                "ay": ay_body,
+                "w": w,
+                "beta_deg": np.rad2deg(beta),
+                "R_ratio_f": R_ratio_f,
+                "reason": "vx_too_low",
+            }
+            break
+
+        if alpha_peak > alpha_guard:
+            unstable = True
+            unstable_info = {
+                "t": ti,
+                "vx": vx,
+                "ay": ay_body,
+                "w": w,
+                "beta_deg": np.rad2deg(beta),
+                "alpha_peak_deg": np.rad2deg(alpha_peak),
+                "R_ratio_f": R_ratio_f,
+                "reason": "excessive_slip_angle",
+            }
+            break
+
+        # -------------------------------------------------
+        # Critérios de fim do ensaio
+        # -------------------------------------------------
+        can_eval = (ti > t_criteria_start) and (V > V_min_for_criteria)
+
+        beta_growth = False
+
+        if use_beta_growth_criterion and can_eval:
+            if (abs(beta) > beta_abs_min) and (abs(beta_dot_f) > beta_dot_lim):
+                beta_growth_timer += dt
+            else:
+                beta_growth_timer = max(0.0, beta_growth_timer - 2.0 * dt)
+
+            beta_growth = beta_growth_timer >= hold_time_beta
+
+        radius_open = False
+
+        if (
+            use_radius_open_criterion
+            and can_eval
+            and (abs(chi_dot) > chi_dot_min_for_R)
+            and np.isfinite(R_ratio_f)
+        ):
+            if R_ratio_f > R_ratio_lim:
+                R_open_timer += dt
+            else:
+                R_open_timer = max(0.0, R_open_timer - 2.0 * dt)
+
+            radius_open = R_open_timer >= hold_time_R
+
+        if radius_open:
+            unstable = True
+            unstable_info = {
+                "t": ti,
+                "vx": vx,
+                "ay": ay_body,
+                "w": w,
+                "beta_deg": np.rad2deg(beta),
+                "R_est_path": R_est_path,
+                "R_ratio_f": R_ratio_f,
+                "reason": "R_path/R_open (understeer-limit)",
+            }
+            break
+
+        if beta_growth:
+            unstable = True
+            unstable_info = {
+                "t": ti,
+                "vx": vx,
+                "ay": ay_body,
+                "w": w,
+                "beta_deg": np.rad2deg(beta),
+                "beta_dot_deg_s": np.rad2deg(beta_dot_f),
+                "R_ratio_f": R_ratio_f,
+                "reason": "beta_growth_rate",
+            }
+            break
+
+    # =====================================================
+    # OUTPUT DA SIMULAÇÃO
+    # =====================================================
+    result = {
+        "unstable": unstable,
+        "reason": unstable_info.get("reason", "completed"),
+
+        "t_final_s": unstable_info.get("t", ti),
+        "vx_final_mps": unstable_info.get("vx", vx),
+        "ay_final_mps2": unstable_info.get("ay", ay_body),
+        "w_final_radps": unstable_info.get("w", w),
+        "beta_final_deg": unstable_info.get("beta_deg", np.rad2deg(beta)),
+        "R_ratio_f_final": unstable_info.get("R_ratio_f", R_ratio_f),
+
+        "ay_max_abs_mps2": ay_max_abs,
+        "ay_max_mps2": ay_max,
+        "ay_min_mps2": ay_min,
+
+        "ax_max_abs_mps2": ax_max_abs,
+        "beta_max_abs_deg": beta_max_abs_deg,
+        "alpha_peak_max_deg": alpha_peak_max_deg,
+        "w_max_abs_radps": w_max_abs,
+
+        # Geometria derivada
+        "a_used_m": a,
+        "b_used_m": b,
+        "L_used_m": L,
+        "cg_frac_front_used": cg_frac_front,
+        "cg_frac_rear_used": 1.0 - cg_frac_front,
+
+        # Distribuição de massa
+        "front_static_frac": b / L,
+        "rear_static_frac": a / L,
+
+        # Inércia
+        "Iz_base_kgm2": Iz_base,
+        "Iz_used_kgm2": Iz,
+    }
+
+    return result
+
+
+# =========================================================
+# 4) MONTE CARLO
+# =========================================================
+
+def run_monte_carlo(
+    base_params,
+    mc_param_names,
+    n_runs=100,
+    variation=0.05,
+    seed=42,
+    dt=0.001,
+    t_total=200.0,
+):
+    """
+    Corre Monte Carlo com variação uniforme +/- variation.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    rows = []
+
+    for run_id in range(n_runs):
+        params = base_params.copy()
+
+        factors = rng.uniform(
+            low=1.0 - variation,
+            high=1.0 + variation,
+            size=len(mc_param_names),
+        )
+
+        for name, factor in zip(mc_param_names, factors):
+            params[name] = base_params[name] * factor
+
+        result = run_simulation(
+            params=params,
+            dt=dt,
+            t_total=t_total,
+            debug=False,
+        )
+
+        row = {
+            "run_id": run_id,
+        }
+
+        # Valores absolutos dos parâmetros usados
+        for name in mc_param_names:
+            row[name] = params[name]
+
+        # Factores e variações percentuais
+        for name, factor in zip(mc_param_names, factors):
+            row[f"{name}_factor"] = factor
+            row[f"{name}_delta_pct"] = 100.0 * (factor - 1.0)
+
+        row.update(result)
+        rows.append(row)
+
+        print(
+            f"Run {run_id + 1:3d}/{n_runs} | "
+            f"ay_max_abs={result['ay_max_abs_mps2']:.3f} m/s² | "
+            f"ay_final={result['ay_final_mps2']:.3f} m/s² | "
+            f"L={result['L_used_m']:.3f} m | "
+            f"a={result['a_used_m']:.3f} m | "
+            f"b={result['b_used_m']:.3f} m | "
+            f"front={100.0 * result['front_static_frac']:.1f}% | "
+            f"reason={result['reason']}"
+        )
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# 5) ANÁLISE DE SENSIBILIDADE
+# =========================================================
+
+def analyse_sensitivity(df_mc, mc_param_names, target_col="ay_max_abs_mps2"):
+    """
+    Calcula ranking de sensibilidade dos parâmetros ao target escolhido.
+
+    Usa:
+        - correlação Pearson
+        - correlação Spearman
+        - regressão linear com variáveis normalizadas
+    """
+
+    factor_cols = [f"{name}_factor" for name in mc_param_names]
+
+    X = df_mc[factor_cols].to_numpy()
+    y = df_mc[target_col].to_numpy()
+
+    # Remover linhas inválidas
+    valid = np.isfinite(y)
+
+    for j in range(X.shape[1]):
+        valid &= np.isfinite(X[:, j])
+
+    X = X[valid]
+    y = y[valid]
+
+    if len(y) < 3:
+        raise ValueError("Dados insuficientes para análise de sensibilidade.")
+
+    # Normalização
+    X_std = X.std(axis=0, ddof=1)
+    y_std = y.std(ddof=1)
+
+    if np.any(X_std < 1e-12):
+        raise ValueError("Existe pelo menos um parâmetro sem variação.")
+
+    if y_std < 1e-12:
+        raise ValueError("O target praticamente não varia. A sensibilidade não é fiável.")
+
+    Xz = (X - X.mean(axis=0)) / X_std
+    yz = (y - y.mean()) / y_std
+
+    # Regressão linear normalizada:
+    # yz = beta0 + beta_i * Xz_i
+    Xreg = np.column_stack([np.ones(len(Xz)), Xz])
+    beta = np.linalg.lstsq(Xreg, yz, rcond=None)[0][1:]
+
+    rows = []
+
+    for i, name in enumerate(mc_param_names):
+        x = X[:, i]
+
+        pearson = np.corrcoef(x, y)[0, 1]
+        spearman = spearman_corr(x, y)
+
+        rows.append({
+            "parametro": name,
+            "pearson": pearson,
+            "abs_pearson": abs(pearson),
+            "spearman": spearman,
+            "abs_spearman": abs(spearman),
+            "beta_regressao_normalizada": beta[i],
+            "abs_beta_regressao_normalizada": abs(beta[i]),
+        })
+
+    df_sens = pd.DataFrame(rows)
+
+    df_sens = df_sens.sort_values(
+        "abs_beta_regressao_normalizada",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    return df_sens
+
+
+# =========================================================
+# 6) EXECUÇÃO
+# =========================================================
+
+if __name__ == "__main__":
+
+    N_RUNS = 100
+    VARIATION = 0.05
+
+    dt = 0.001
+    t_total = 200.0
+
+    df_mc = run_monte_carlo(
+        base_params=base_params,
+        mc_param_names=mc_param_names,
+        n_runs=N_RUNS,
+        variation=VARIATION,
+        seed=42,
+        dt=dt,
+        t_total=t_total,
+    )
+
+    # -----------------------------------------------------
+    # Guardar resultados brutos
+    # -----------------------------------------------------
+    mc_filename = "monte_carlo_iso4138_resultados_corrigido_cg.csv"
+
+    df_mc.to_csv(
+        mc_filename,
+        index=False,
+        sep=";",
+    )
+
+    print("\nResultados Monte Carlo guardados em:")
+    print(mc_filename)
+
+    # -----------------------------------------------------
+    # Sensibilidade para ay máximo absoluto
+    # -----------------------------------------------------
+    target_col = "ay_max_abs_mps2"
+
+    df_sens = analyse_sensitivity(
+        df_mc=df_mc,
+        mc_param_names=mc_param_names,
+        target_col=target_col,
+    )
+
+    sens_filename = "monte_carlo_iso4138_sensibilidade_ay_corrigido_cg.csv"
+
+    df_sens.to_csv(
+        sens_filename,
+        index=False,
+        sep=";",
+    )
+
+    print("\nRanking de sensibilidade para:", target_col)
+    print(df_sens)
+
+    print("\nSensibilidade guardada em:")
+    print(sens_filename)
+
+    # =====================================================
+    # 7) ANÁLISE EXTRA DOS PARÂMETROS DE CG
+    # =====================================================
+
+    print("\nResumo geométrico:")
+    print(df_mc[[
+        "a_used_m",
+        "b_used_m",
+        "L_used_m",
+        "cg_frac_front_used",
+        "front_static_frac",
+        "rear_static_frac",
+    ]].describe())
+
+    # =====================================================
+    # 8) GRÁFICOS
+    # =====================================================
+
+    # -----------------------------------------------------
+    # Histograma de ay
+    # -----------------------------------------------------
+    plt.figure(figsize=(10, 5))
+    plt.hist(df_mc[target_col], bins=15, edgecolor="black")
+    plt.grid(True)
+    plt.xlabel("ay máximo absoluto [m/s²]")
+    plt.ylabel("Frequência")
+    plt.title("Distribuição Monte Carlo de ay máximo absoluto")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Ranking por regressão normalizada
+    # -----------------------------------------------------
+    plt.figure(figsize=(10, 6))
+    plt.barh(
+        df_sens["parametro"],
+        df_sens["abs_beta_regressao_normalizada"],
+    )
+    plt.gca().invert_yaxis()
+    plt.grid(True, axis="x")
+    plt.xlabel("|coeficiente de regressão normalizado|")
+    plt.title("Ranking de influência em ay")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Pearson com sinal
+    # -----------------------------------------------------
+    df_pearson = df_sens.sort_values("pearson")
+
+    plt.figure(figsize=(10, 6))
+    plt.barh(
+        df_pearson["parametro"],
+        df_pearson["pearson"],
+    )
+    plt.grid(True, axis="x")
+    plt.xlabel("Correlação Pearson com ay")
+    plt.title("Efeito com sinal sobre ay")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Scatter dos 5 parâmetros mais influentes
+    # -----------------------------------------------------
+    top_params = df_sens["parametro"].head(5).tolist()
+
+    for param in top_params:
+        plt.figure(figsize=(8, 5))
+        plt.scatter(
+            df_mc[f"{param}_delta_pct"],
+            df_mc[target_col],
+            alpha=0.75,
+        )
+        plt.grid(True)
+        plt.xlabel(f"Variação de {param} [%]")
+        plt.ylabel("ay máximo absoluto [m/s²]")
+        plt.title(f"Sensibilidade de ay a {param}")
+        plt.tight_layout()
+        plt.show()
+
+    # -----------------------------------------------------
+    # Contagem dos motivos de paragem
+    # -----------------------------------------------------
+    plt.figure(figsize=(10, 5))
+    df_mc["reason"].value_counts().plot(kind="bar")
+    plt.grid(True, axis="y")
+    plt.ylabel("Número de runs")
+    plt.title("Motivo de paragem das simulações")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Relação directa entre h_CG e ay
+    # -----------------------------------------------------
+    plt.figure(figsize=(8, 5))
+    plt.scatter(
+        df_mc["h_CG_delta_pct"],
+        df_mc[target_col],
+        alpha=0.75,
+    )
+    plt.grid(True)
+    plt.xlabel("Variação de h_CG [%]")
+    plt.ylabel("ay máximo absoluto [m/s²]")
+    plt.title("Influência da altura do C.G. em ay")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Relação directa entre L e ay
+    # -----------------------------------------------------
+    plt.figure(figsize=(8, 5))
+    plt.scatter(
+        df_mc["L_delta_pct"],
+        df_mc[target_col],
+        alpha=0.75,
+    )
+    plt.grid(True)
+    plt.xlabel("Variação de L [%]")
+    plt.ylabel("ay máximo absoluto [m/s²]")
+    plt.title("Influência da distância entre eixos em ay")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Relação directa entre posição relativa do CG e ay
+    # -----------------------------------------------------
+    plt.figure(figsize=(8, 5))
+    plt.scatter(
+        df_mc["cg_frac_front_delta_pct"],
+        df_mc[target_col],
+        alpha=0.75,
+    )
+    plt.grid(True)
+    plt.xlabel("Variação de cg_frac_front [%]")
+    plt.ylabel("ay máximo absoluto [m/s²]")
+    plt.title("Influência da posição longitudinal relativa do C.G. em ay")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Relação entre percentagem de massa dianteira e ay
+    # -----------------------------------------------------
+    plt.figure(figsize=(8, 5))
+    plt.scatter(
+        100.0 * df_mc["front_static_frac"],
+        df_mc[target_col],
+        alpha=0.75,
+    )
+    plt.grid(True)
+    plt.xlabel("Distribuição estática dianteira [%]")
+    plt.ylabel("ay máximo absoluto [m/s²]")
+    plt.title("Influência da distribuição estática dianteira em ay")
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------------------------------
+    # Relação directa entre Iz usado e ay
+    # -----------------------------------------------------
+    plt.figure(figsize=(8, 5))
+    plt.scatter(
+        df_mc["Iz_used_kgm2"],
+        df_mc[target_col],
+        alpha=0.75,
+    )
+    plt.grid(True)
+    plt.xlabel("Iz usado [kg.m²]")
+    plt.ylabel("ay máximo absoluto [m/s²]")
+    plt.title("Influência directa de Iz em ay")
+    plt.tight_layout()
+    plt.show()
